@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "agario-kit",
+  "numpy>=2.5.1",
 ]
 
 [tool.uv]
