@@ -82,12 +82,12 @@ def virus_vector(game, danger_weight, safety_weight, player):
 
     unit_to_virus = vectors_to_virus / dists.reshape(-1, 1)
 
-    bigger_than_virus = player.radius > 0.9 * virus_radii
-    smaller_than_virus = player.radius < virus_radii
+    smaller_than_virus = player.radius < 0.7 * virus_radii
+    bigger_than_virus = ~smaller_than_virus
 
     forces = np.zeros_like(unit_to_virus)
 
-    danger = danger_weight / (dists ** 2)
+    danger = danger_weight / (dists ** 4)
     safety = safety_weight / (dists ** 2)
 
     forces[bigger_than_virus] = -unit_to_virus[bigger_than_virus] * danger[bigger_than_virus].reshape(-1, 1)
@@ -115,8 +115,8 @@ def choose_direction(game: Game) -> tuple[float, float]:
     
     virus_force = virus_vector(
         game, 
-        danger_weight=6000, 
-        safety_weight=300, 
+        danger_weight=4500, 
+        safety_weight=100, 
         player=me
     )
 
