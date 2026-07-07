@@ -82,7 +82,7 @@ def virus_vector(game, danger_weight, safety_weight, player):
 
     unit_to_virus = vectors_to_virus / dists.reshape(-1, 1)
 
-    bigger_than_virus = player.radius > virus_radii
+    bigger_than_virus = player.radius > 0.9 * virus_radii
     smaller_than_virus = player.radius < virus_radii
 
     forces = np.zeros_like(unit_to_virus)
