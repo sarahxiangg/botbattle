@@ -67,23 +67,65 @@ def enemy_vector(game, danger_weight, hunt_weight, player):
     return forces.sum(axis=0)
 
 def virus_vector(game, danger_weight, safety_weight, player):
-    pass
+    viruses = game.state.visible_viruses
+
+    if not viruses:
+        return np.array([0.0, 0.0])
+
+    virus_locs = np.array([virus.pos for virus in viruses], dtype=float)
+    virus_radii = np.array([virus.radius for virus in viruses], dtype=float)
+    player_loc = np.array([player.x, player.y], dtype=float)
+
+    vectors_to_virus = virus_locs - player_loc
+    dists = np.linalg.norm(vectors_to_virus, axis=1)
+    dists[dists == 0] = 1
+
+    unit_to_virus = vectors_to_virus / dists.reshape(-1, 1)
+
+    bigger_than_virus = player.radius > virus_radii
+    smaller_than_virus = player.radius < virus_radii
+
+    forces = np.zeros_like(unit_to_virus)
+
+    danger = danger_weight / (dists ** 2)
+    safety = safety_weight / (dists ** 2)
+
+    forces[bigger_than_virus] = -unit_to_virus[bigger_than_virus] * danger[bigger_than_virus].reshape(-1, 1)
+    forces[smaller_than_virus] = unit_to_virus[smaller_than_virus] * safety[smaller_than_virus].reshape(-1, 1)
+
+    return forces.sum(axis=0)
 
 
 
 def choose_direction(game: Game) -> tuple[float, float]:
     me = game.state.me
 
-    food_force = food_vector(game, weight=1000, player=me)
-    enemy_force = enemy_vector(game, danger_weight=3000, hunt_weight=1500, player=me)
-    
-    dx = food_force[0] + enemy_force[0] 
-    dy = food_force[1] + enemy_force[1] 
+    food_force = food_vector(
+        game, 
+        weight=1000, 
+        player=me
+    )
 
-    if dx == 0 and dy == 0:
-        return (1.0, 0.0)
+    enemy_force = enemy_vector(
+        game, 
+        danger_weight=3000, 
+        hunt_weight=1500, 
+        player=me
+    )
     
-    return (dx, dy)
+    virus_force = virus_vector(
+        game, 
+        danger_weight=6000, 
+        safety_weight=300, 
+        player=me
+    )
+
+    dir = food_force + enemy_force + virus_force
+
+    if np.allclose(dir, [0.0, 0.0]):
+        return (1.0, 1.0)
+    
+    return (float(dir[0]), float(dir[1]))
 
 
 def main() -> None:
