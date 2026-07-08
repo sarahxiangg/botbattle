@@ -24,9 +24,10 @@ FOOD_WEIGHT_SMALL = 1200.0
 FOOD_WEIGHT_MEDIUM = 900.0
 FOOD_WEIGHT_BIG = 700.0
 
-ENEMY_DANGER_WEIGHT = 11000.0
+ENEMY_DANGER_WEIGHT = 13000.0
 VIRUS_DANGER_WEIGHT = 10000.0
 VIRUS_SAFE_WEIGHT = 0.0
+DANGER_DISTANCE_POWER = 1.3
 
 # Anti-jitter
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
@@ -48,7 +49,6 @@ MAX_VIRUSES_CONSIDERED = 10
 EAT_RATIO = 1.12
 CLOSE_KILL_RANGE_MULT = 2.2
 CLOSE_OVERRIDE_RANGE_MULT = 1.4
-DANGER_DISTANCE_POWER = 1.5
 
 # Splitting
 SPLIT_EAT_RATIO = 1.15
@@ -73,6 +73,14 @@ OFF_MAP_PENALTY = 1_000_000_000.0
 # =========================
 # Cache utilities
 # =========================
+
+def clamp_position(cache, x, y):
+    r = cache["player_radius"]
+
+    x = min(max(x, r), ARENA_SIZE - r)
+    y = min(max(y, r), ARENA_SIZE - r)
+
+    return x, y
 
 def cap_nearest(locs, max_items, player_pos, *arrays):
     if len(locs) <= max_items:
@@ -499,7 +507,7 @@ def enemy_escape_direction(cache, step_distance):
     danger_size = np.maximum(blob_rads, merged_rads)
 
     dangerous = danger_size > player_radius * 1.10
-    too_close = edge_dists < player_radius * 2.5
+    too_close = edge_dists < player_radius * 3.5
 
     if not np.any(dangerous & too_close):
         return None
@@ -512,6 +520,8 @@ def enemy_escape_direction(cache, step_distance):
 
         future_x = cache["player_x"] + dx * step_distance
         future_y = cache["player_y"] + dy * step_distance
+
+        future_x, future_y = clamp_position(cache, future_x, future_y)
 
         score = 0.0
 
@@ -553,7 +563,9 @@ def override_direction(cache, step_distance):
         dx, dy = kill_dir
 
         future_x = cache["player_x"] + dx * step_distance
-        future_y = cache["player_y"] + dy * step_distance
+        future_y = cache["player_y"] + dy * 
+        
+        future_x, future_y = clamp_position(cache, future_x, future_y)
 
         safe_kill = (
             wall_score(cache, future_x, future_y) != -OFF_MAP_PENALTY and
@@ -573,6 +585,8 @@ def override_direction(cache, step_distance):
 
             future_x = cache["player_x"] + dx * step_distance
             future_y = cache["player_y"] + dy * step_distance
+
+            future_x, future_y = clamp_position(cache, future_x, future_y)
 
             if wall_score(cache, future_x, future_y) > -OFF_MAP_PENALTY / 2:
                 return dx, dy
@@ -751,6 +765,8 @@ def choose_direction(game: Game):
 
                 future_x = x + dx * step_distance
                 future_y = y + dy * step_distance
+
+                future_x, future_y = clamp_position(cache, future_x, future_y)
 
                 position_score = score_position(
                     cache,
