@@ -5,15 +5,6 @@ from lib.models.penguin_model import DirectionModel
 
 import numpy as np
 
-import sys 
-import time
-import inspect
-
-start = time.perf_counter()
-dx, dy = choose_direction(game)
-elapsed = time.perf_counter() - start
-print(f"TURN TIME: {elapsed:.4f}s", file=sys.stderr, flush=True)
-
 # =========================
 # Direction search
 # =========================
@@ -385,40 +376,49 @@ def choose_direction(game: Game) -> tuple[float, float]:
 
     return float(final_direction[0]), float(final_direction[1])
 
-
 def main() -> None:
     game = Game()
 
     while True:
         query = game.get_next_query()
+
         match query:
             case QueryMovePlayer():
-                dx, dy = choose_direction(game)
+                try:
+                    dx, dy = choose_direction(game)
 
-                should_do_split, split_direction = get_split_decision(game, (dx, dy))
+                    should_do_split, split_direction = get_split_decision(game, (dx, dy))
 
-                if should_do_split:
-                    sx, sy = split_direction
-
-                    game.send_move(
-                        MovePlayer(
-                            player_id=game.state.me.player_id,
-                            direction=DirectionModel(
-                                x=float(sx),
-                                y=float(sy),
-                            ),
-                            split=True,
+                    if should_do_split:
+                        sx, sy = split_direction
+                        game.send_move(
+                            MovePlayer(
+                                player_id=game.state.me.player_id,
+                                direction=DirectionModel(
+                                    x=float(sx),
+                                    y=float(sy),
+                                ),
+                                split=True,
+                            )
                         )
-                    )
+                    else:
+                        game.send_move(
+                            MovePlayer(
+                                player_id=game.state.me.player_id,
+                                direction=DirectionModel(
+                                    x=float(dx),
+                                    y=float(dy),
+                                ),
+                                split=False,
+                            )
+                        )
 
-                else:
+                except Exception:
+                    # emergency fallback so we still send a move
                     game.send_move(
                         MovePlayer(
                             player_id=game.state.me.player_id,
-                            direction=DirectionModel(
-                                x=float(dx),
-                                y=float(dy),
-                            ),
+                            direction=DirectionModel(x=1.0, y=0.0),
                             split=False,
                         )
                     )
