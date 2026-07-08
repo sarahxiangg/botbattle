@@ -102,8 +102,19 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     edge_dists = center_dists - player_radius - blob_rads
     edge_dists[edge_dists < 1.0] = 1.0
 
-    bigger = (blob_rads > player_radius * 1.1) | (merged_rads > player_radius * 1.1)
-    smaller = (blob_rads < player_radius * hunt_ratio) & (merged_rads < player_radius * merged_safe_ratio)
+    # Individual blob can directly eat us
+    individually_dangerous = blob_rads > player_radius * 1.1
+
+    # Enemy as a whole is dangerous, but only treat as danger if close
+    merged_dangerous = (merged_rads > player_radius * 1.25) & (edge_dists < player_radius * 4.0)
+
+    bigger = individually_dangerous | merged_dangerous
+
+    # Hunt small blobs unless the enemy's total visible mass is way too large
+    smaller = (
+        (blob_rads < player_radius * hunt_ratio) &
+        (merged_rads < player_radius * merged_safe_ratio)
+    )
 
     danger_size = np.maximum(blob_rads, merged_rads)
 
@@ -310,7 +321,7 @@ def build_cache(game):
         player_pos = np.array([me.x, me.y], dtype=float)
 
         dists = np.sum((food_locs - player_pos) ** 2, axis=1)
-        keep = np.argpartition(dists, MAX_FOOD_CONSIDERED)[:MAX_FOOD_CONSIDERED]
+        keep = np.argpartition(dists, MAX_FOOD_CONSIDERED - 1)[:MAX_FOOD_CONSIDERED]
         food_locs = food_locs[keep]
 
     # --- ENEMY BLOBS ---
@@ -360,30 +371,30 @@ def get_mode_weights(player):
     # Small: need growth, take more food, opportunistic hunts
     if r < 1.5:
         return {
-            "food": 1400.0,
-            "enemy_danger": 6000.0,
-            "enemy_hunt": 3200.0,
-            "hunt_ratio": 0.85,
-            "merged_safe_ratio": 1.05,
+            "food": 1200.0,
+            "enemy_danger": 5000.0,
+            "enemy_hunt": 4500.0,
+            "hunt_ratio": 0.95,
+            "merged_safe_ratio": 1.25,
         }
 
     # Medium: balanced
     if r < 2.5:
         return {
-            "food": 1000.0,
-            "enemy_danger": 8000.0,
-            "enemy_hunt": 2200.0,
-            "hunt_ratio": 0.70,
-            "merged_safe_ratio": 0.95,
+            "food": 900.0,
+            "enemy_danger": 7500.0,
+            "enemy_hunt": 3000.0,
+            "hunt_ratio": 0.80,
+            "merged_safe_ratio": 1.05,
         }
 
     # Big: survival, avoid throwing lead
     return {
         "food": 700.0,
-        "enemy_danger": 12000.0,
-        "enemy_hunt": 1200.0,
-        "hunt_ratio": 0.60,
-        "merged_safe_ratio": 0.85,
+        "enemy_danger": 11000.0,
+        "enemy_hunt": 1500.0,
+        "hunt_ratio": 0.65,
+        "merged_safe_ratio": 0.90,
     }
 
 def choose_direction(game: Game) -> tuple[float, float]:
