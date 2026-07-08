@@ -38,8 +38,7 @@ PREY_RADIUS_RATIO = 0.82
 # Threat / survival scoring.
 THREAT_RADIUS_RATIO = 1.06
 SAFETY_MARGIN = 2.2
-SPLIT_THREAT_RATIO = 1.65
-SPLIT_REACH_MULT = 3.2
+# SPLIT_THREAT_RATIO / SPLIT_REACH_MULT removed: counter-split logic uses COUNTER_SPLIT_* instead.
 
 # Counter-split prediction. This is the main anti-"big blob suddenly splits and eats us" mechanism.
 COUNTER_SPLIT_REACTION_MARGIN = 1.4
@@ -74,6 +73,18 @@ VIRUS_PATH_MARGIN = 0.2
 EARLY_GAME_THRESHOLD = 0.25
 EARLY_THREAT_RATIO = 1.15
 EARLY_FARM_STICKINESS = 7.0
+EARLY_FARMING_SMOOTHING = 0.4  # less smoothing → faster pivots in first 25% of rounds
+
+# Wall avoidance: linear-ramp cone blocks wall-facing angles proportionally to proximity.
+# (Using _danger_cone with a fixed radius clamped to ±90° when dist < radius; this is correct.)
+EDGE_AVOID_MARGIN = 6.0        # wall danger activates within this distance of player centre
+
+# Survival safe-angle selection: bias toward aggregate escape direction.
+FLEE_DIRECTION_WEIGHT = 2.5    # score bonus for angles aligned with aggregate escape direction
+
+# Merge drive: aim toward mass-weighted centroid once blobs can merge.
+MERGE_PULL_WEIGHT = 85.0       # goal score weight for convergence heading
+MERGE_READY_COOLDOWN = 3       # merge_cooldown threshold to count a blob as merge-ready
 
 _LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
 _LAST_SPLIT_ROUND = -9999
@@ -94,6 +105,7 @@ class _Ctx:
         "food_clusters",
         "round_index",
         "round_frac",
+        "arena_size",
     )
 
     def __init__(
@@ -109,6 +121,7 @@ class _Ctx:
         food_clusters: list,
         round_index: int,
         round_frac: float,
+        arena_size: float,
     ) -> None:
         self.player_id = player_id
         self.player_pos = player_pos
@@ -121,6 +134,7 @@ class _Ctx:
         self.food_clusters = food_clusters
         self.round_index = round_index
         self.round_frac = round_frac
+        self.arena_size = arena_size
 
 
 def _pos(obj) -> np.ndarray:
@@ -324,7 +338,10 @@ def _shift_into_gap(
         if target_is_ambiguous or preference_is_safe:
             return start if _angle_diff(start, preferred_angle) < _angle_diff(end, preferred_angle) else end
 
-    return start if dist_to_start < dist_to_end else end
+    # Use true bidirectional angular distance rather than the directed sweep metric.
+    # The old (angle - start) % TAU is a CCW-sweep measure; in corners it picks the
+    # geometrically FAR gap edge (e.g. 225° SW instead of 45° NE) causing wall-hugging.
+    return start if _angle_diff(angle, start) <= _angle_diff(angle, end) else end
 
 
 def _build_food_clusters(visible_food: list, player_radius: float) -> list[dict]:
@@ -406,6 +423,31 @@ def _target_score(angle: float, ctx: _Ctx) -> float:
             score += alignment * (PREY_VALUE_WEIGHT * size_value / distance)
 
     return score
+
+
+def _food_gravity_angle(ctx: _Ctx) -> float | None:
+    """Inverse-distance-squared weighted centroid direction over all visible food pellets.
+
+    Adapted from my_bot.py's food_direction(). Weights every pellet by 1/d², so dense
+    nearby clusters dominate while distant sparse pellets still contribute a gentle pull.
+    This complements cluster scoring: clusters give per-region density context; gravity
+    gives a smooth aggregate gradient that can win when many small clusters tie in score.
+    """
+    if not ctx.visible_food:
+        return None
+    food_locs = np.array([_pos(f) for f in ctx.visible_food], dtype=float)
+    delta = food_locs - ctx.player_pos
+    # sq_dists clamped to ≥1 so nearby pellets don't produce runaway weights.
+    sq_dists = np.maximum(1.0, delta[:, 0] ** 2 + delta[:, 1] ** 2)
+    weights = 1.0 / sq_dists
+    total_w = float(np.sum(weights))
+    if total_w < 1e-9:
+        return None
+    centroid = np.dot(weights, food_locs) / total_w
+    to_centroid = centroid - ctx.player_pos
+    if _norm(to_centroid) < 1e-6:
+        return None
+    return _angle_of(to_centroid)
 
 
 def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
@@ -676,6 +718,29 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
             if interval is not None:
                 blocked.append(interval)
 
+    # Wall avoidance: block angles toward nearby walls using a linear-ramp cone.
+    # half_angle = π/2 × (1 − dist/MARGIN): wide near wall, zero at the margin boundary.
+    if ctx.arena_size > 0:
+        S = ctx.arena_size
+        px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
+        for dist_to_wall, wall_angle in (
+            (px,      math.pi),
+            (S - px,  0.0),
+            (py,      3.0 * math.pi / 2),
+            (S - py,  math.pi / 2),
+        ):
+            if 0 < dist_to_wall < EDGE_AVOID_MARGIN:
+                half_angle = (math.pi / 2) * (1.0 - dist_to_wall / EDGE_AVOID_MARGIN)
+                if half_angle > 0.02:
+                    interval = _blocked_interval(wall_angle, half_angle)
+                    if interval is not None:
+                        blocked.append(interval)
+                escape_angle = (wall_angle + math.pi) % TAU
+                emergency_away.append(
+                    np.array([math.cos(escape_angle), math.sin(escape_angle)])
+                    * (EDGE_AVOID_MARGIN / max(1.0, dist_to_wall))
+                )
+
     return blocked, emergency_away, has_threat
 
 
@@ -683,14 +748,32 @@ def _best_safe_angle(
     ctx: _Ctx,
     gaps: list[tuple[float, float]],
     previous_angle: float,
+    emergency_away: list[np.ndarray],
 ) -> float:
     best_angle = gaps[0][0] + gaps[0][1] / 2.0
     best_score = -float("inf")
+
+    # Pre-compute aggregate flee direction and food gravity for candidate generation.
+    flee_angle: float | None = None
+    if emergency_away:
+        flee_sum = np.sum(emergency_away, axis=0)
+        flee_len = _norm(flee_sum)
+        if flee_len > 1e-6:
+            flee_angle = _angle_of(flee_sum / flee_len)
+    gravity_angle = _food_gravity_angle(ctx)  # 1/d²-weighted food centroid direction
 
     candidate_angles: list[float] = []
     for gap in gaps:
         candidate_angles.append((gap[0] + gap[1] / 2.0) % TAU)
         candidate_angles.append(_shift_into_gap(previous_angle, gap, previous_angle))
+
+        # Explicit escape direction: ensures we consider fleeing even with no food nearby.
+        if flee_angle is not None:
+            candidate_angles.append(_shift_into_gap(flee_angle, gap, flee_angle))
+
+        # Gravity food direction: smooth pull toward densest nearby food region.
+        if gravity_angle is not None:
+            candidate_angles.append(_shift_into_gap(gravity_angle, gap, previous_angle))
 
         for cluster in ctx.food_clusters:
             candidate_angles.append(
@@ -713,7 +796,11 @@ def _best_safe_angle(
         gap = max(containing_gaps, key=lambda item: item[1])
         centeredness = math.cos(_angle_diff(angle, (gap[0] + gap[1] / 2.0) % TAU))
         heading_stickiness = SURVIVAL_HEADING_STICKINESS * math.cos(_angle_diff(angle, previous_angle))
-        score = gap[1] * 2.0 + centeredness + heading_stickiness + _target_score(angle, ctx)
+        flee_score = (
+            FLEE_DIRECTION_WEIGHT * math.cos(_angle_diff(angle, flee_angle))
+            if flee_angle is not None else 0.0
+        )
+        score = gap[1] * 2.0 + centeredness + heading_stickiness + flee_score + _target_score(angle, ctx)
 
         if score > best_score:
             best_score = score
@@ -736,6 +823,17 @@ def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
             best_score = score
             best_angle = angle
 
+    # Food gravity: 1/d²-weighted centroid of all visible pellets (adapted from my_bot.py).
+    # Wins when many small clusters tie in value — the aggregate pull breaks the tie toward
+    # the region with the most pellets overall, not just the single richest cluster.
+    gravity_angle = _food_gravity_angle(ctx)
+    if gravity_angle is not None:
+        heading_stickiness = farm_stickiness * math.cos(_angle_diff(gravity_angle, previous_angle))
+        score = _target_score(gravity_angle, ctx) + heading_stickiness
+        if score > best_score:
+            best_score = score
+            best_angle = gravity_angle
+
     for blob in ctx.visible_blobs:
         if blob.player_id == ctx.player_id:
             continue
@@ -755,6 +853,24 @@ def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
             if score > best_score:
                 best_score = score
                 best_angle = angle
+
+    # Merge drive: converge split blobs toward mass-weighted centroid once merge cooldown expires.
+    if len(ctx.my_blobs) > 1:
+        ready = [b for b in ctx.my_blobs if int(getattr(b, "merge_cooldown", 999)) <= MERGE_READY_COOLDOWN]
+        if len(ready) >= 2:
+            total_m = sum(_radius(b) ** 2 for b in ctx.my_blobs)
+            if total_m > 0:
+                cx = sum(_blob_pos(b)[0] * _radius(b) ** 2 for b in ctx.my_blobs) / total_m
+                cy = sum(_blob_pos(b)[1] * _radius(b) ** 2 for b in ctx.my_blobs) / total_m
+                to_centroid = np.array([cx, cy]) - ctx.player_pos
+                dist_centroid = _norm(to_centroid)
+                if dist_centroid > ctx.player_radius * 0.5:
+                    angle = _angle_of(to_centroid)
+                    heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
+                    score = MERGE_PULL_WEIGHT + heading_stickiness
+                    if score > best_score:
+                        best_score = score
+                        best_angle = angle
 
     return best_angle, best_score != -float("inf")
 
@@ -803,6 +919,12 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
     cur_round = int(getattr(game.state, "round", 0) or 0)
     max_rounds = int(getattr(game.state, "max_rounds", 1) or 1)
     round_frac = cur_round / max(1, max_rounds)
+    arena_size = 60.0
+    try:
+        arena_size = float(game.state.map.size or 60.0)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    farming_smoothing = FARMING_SMOOTHING if round_frac > EARLY_GAME_THRESHOLD else EARLY_FARMING_SMOOTHING
 
     visible_blobs = list(game.state.visible_blobs or [])
     visible_food = list(game.state.visible_food or [])
@@ -823,6 +945,7 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
         food_clusters=_build_food_clusters(visible_food, player_radius),
         round_index=cur_round,
         round_frac=round_frac,
+        arena_size=arena_size,
     )
 
     blocked, emergency_away, has_threat = _blocked_angles(ctx)
@@ -830,7 +953,7 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
 
     if has_threat:
         if gaps:
-            angle = _best_safe_angle(ctx, gaps, previous_angle)
+            angle = _best_safe_angle(ctx, gaps, previous_angle, emergency_away)
             dx, dy = _smoothed_direction(np.array(_angle_to_vec(angle)), SURVIVAL_SMOOTHING)
             return dx, dy, False
 
@@ -846,13 +969,28 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
 
     best_angle, found_goal = _best_goal_angle(ctx, previous_angle)
     if not found_goal:
-        dx, dy = _smoothed_direction(np.array([1.0, 0.0]), FARMING_SMOOTHING)
+        dx, dy = _smoothed_direction(np.array([1.0, 0.0]), farming_smoothing)
         return dx, dy, False
 
     if blocked and gaps:
-        best_angle = _best_routed_goal_angle(ctx, gaps, best_angle, previous_angle)
+        # When near walls (no enemies), blend goal with wall-escape direction before routing.
+        # Without blending: food behind a wall causes _best_routed_goal_angle to hug the
+        # nearest gap edge in the food direction, which follows the wall into the next corner.
+        # With blending: effective_goal rotates toward open space, routing escapes correctly.
+        effective_goal = best_angle
+        if not has_threat and emergency_away:
+            flee_sum = np.sum(emergency_away, axis=0)
+            flee_len = float(_norm(flee_sum))
+            if flee_len > 0.1:
+                w = min(0.75, flee_len / (flee_len + 2.0))
+                flee_dir = flee_sum / flee_len
+                goal_dir = np.array(_angle_to_vec(best_angle))
+                blended = goal_dir * (1.0 - w) + flee_dir * w
+                if _norm(blended) > 1e-6:
+                    effective_goal = _angle_of(blended)
+        best_angle = _best_routed_goal_angle(ctx, gaps, effective_goal, previous_angle)
 
-    dx, dy = _smoothed_direction(np.array(_angle_to_vec(best_angle)), FARMING_SMOOTHING)
+    dx, dy = _smoothed_direction(np.array(_angle_to_vec(best_angle)), farming_smoothing)
     return dx, dy, False
 
 
