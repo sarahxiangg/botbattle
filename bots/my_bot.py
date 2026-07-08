@@ -48,6 +48,7 @@ MAX_VIRUSES_CONSIDERED = 10
 EAT_RATIO = 1.12
 CLOSE_KILL_RANGE_MULT = 2.2
 CLOSE_OVERRIDE_RANGE_MULT = 1.4
+DANGER_DISTANCE_POWER = 1.5
 
 # Splitting
 SPLIT_EAT_RATIO = 1.15
@@ -281,7 +282,7 @@ def enemy_score(cache, future_x, future_y, danger_weight, hunt_weight, hunt_rati
 
     danger_size = np.maximum(blob_rads, merged_rads)
 
-    danger_scores = danger_weight * (danger_size / player_radius) / (edge_dists ** 2)
+    danger_scores = danger_weight * (danger_size / player_radius) / (edge_dists ** DANGER_DISTANCE_POWER)
     hunt_scores = hunt_weight * (player_radius / blob_rads) / (edge_dists ** 2)
 
     score = 0.0
@@ -317,15 +318,15 @@ def virus_score(cache, future_x, future_y, danger_weight):
 
 
 def wall_score(cache, x, y):
-    player_radius = cache["player_radius"]
+    # player_radius = cache["player_radius"]
 
-    if (
-        x - player_radius <= 0 or
-        x + player_radius >= ARENA_SIZE or
-        y - player_radius <= 0 or
-        y + player_radius >= ARENA_SIZE
-    ):
-        return -OFF_MAP_PENALTY
+    # if (
+    #     x - player_radius <= 0 or
+    #     x + player_radius >= ARENA_SIZE or
+    #     y - player_radius <= 0 or
+    #     y + player_radius >= ARENA_SIZE
+    # ):
+    #     return -OFF_MAP_PENALTY
 
     return 0.0
 
@@ -701,17 +702,6 @@ def get_split_decision(move_direction, cache):
 
         blob_uv = blob_uvs[idx]
         split_landing = player_pos + blob_uv * split_range
-
-        landing_x = split_landing[0]
-        landing_y = split_landing[1]
-
-        if (
-            landing_x - split_radius <= 0 or
-            landing_x + split_radius >= ARENA_SIZE or
-            landing_y - split_radius <= 0 or
-            landing_y + split_radius >= ARENA_SIZE
-        ):
-            continue
 
         if not split_path_safe(cache, split_radius, split_landing):
             continue
