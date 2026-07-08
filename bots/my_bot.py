@@ -77,7 +77,7 @@ VIRUS_DANGER_WEIGHT = 12000.0
 VIRUS_HARD_BUFFER_MULT = 0.65
 VIRUS_PATH_BUFFER_MULT = 0.65
 
-VIRUS_FARM_MIN_RADIUS = 2.2
+VIRUS_FARM_MIN_RADIUS = 0.0
 VIRUS_FARM_EAT_RATIO = 1.10
 VIRUS_FARM_ENEMY_RANGE_MULT = 8.0
 VIRUS_FARM_PIECE_RADIUS_MULT = 0.45
@@ -950,9 +950,6 @@ def virus_farming_override(cache, step_distance):
     if cache["own_blob_count"] != 1:
         return None
 
-    if cache["player_radius"] < VIRUS_FARM_MIN_RADIUS:
-        return None
-
     virus_locs = cache["virus_locs"]
     virus_rads = cache["virus_rads"]
 
@@ -960,6 +957,7 @@ def virus_farming_override(cache, step_distance):
         return None
 
     player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
 
     vectors = virus_locs - player_pos
     dists = np.linalg.norm(vectors, axis=1)
@@ -967,7 +965,8 @@ def virus_farming_override(cache, step_distance):
     safe_dists = dists.copy()
     safe_dists[safe_dists < 1.0] = 1.0
 
-    can_farm = cache["player_radius"] > virus_rads * VIRUS_FARM_EAT_RATIO
+    # This is the only real "is virus farming possible?" check.
+    can_farm = player_radius > virus_rads * VIRUS_FARM_EAT_RATIO
 
     if not np.any(can_farm):
         return None
@@ -1113,23 +1112,24 @@ def override_direction(cache, step_distance):
     if unstuck_dir is not None:
         return unstuck_dir
 
-    # 3. Food farming.
+    # 3. Virus farming.
+    virus_dir = virus_farming_override(cache, step_distance)
+
+    if virus_dir is not None:
+        return virus_dir
+
+
+    # 4. Food farming.
     food_dir = food_farming_override(cache, step_distance)
 
     if food_dir is not None:
         return food_dir
 
-    # 4. Close kill / chase / split.
+    # 5. Close kill / chase / split.
     kill_dir = close_kill_override(cache, step_distance)
 
     if kill_dir is not None:
         return kill_dir
-
-    # 5. Virus farming.
-    virus_dir = virus_farming_override(cache, step_distance)
-
-    if virus_dir is not None:
-        return virus_dir
 
     return None
 
