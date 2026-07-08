@@ -9,7 +9,13 @@ import numpy as np
 # Direction search
 # =========================
 
-NUM_DIRECTIONS = 12              # directions tested in search
+NUM_DIRECTIONS = 10              # directions tested in search
+
+DIRECTIONS = np.array([
+    [np.cos(2 * np.pi * i / NUM_DIRECTIONS),
+     np.sin(2 * np.pi * i / NUM_DIRECTIONS)]
+    for i in range(NUM_DIRECTIONS)
+], dtype=float)
 
 # =========================
 # Scoring weights
@@ -38,7 +44,7 @@ STICKINESS_WEIGHT = 300.0                           # reward same direction
 ROLLOUT_STEPS = 2                 # future steps checked
 ROLLOUT_DISCOUNT = 0.7            # future score discount
 STEP_DISTANCE_MULT = 1.5          # step size multiplier
-BEAM_WIDTH = 4                    # paths kept per step
+BEAM_WIDTH = 3                    # paths kept per step
 TURN_PENALTY_WEIGHT = 150.0       # discourage sharp turns
 
 
@@ -327,14 +333,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
     player = game.state.me
 
     step_distance = STEP_DISTANCE_MULT * player.radius
-
-    directions = []
     cache = build_cache(game)
-
-    for i in range(NUM_DIRECTIONS):
-        angle = 2 * np.pi * i / NUM_DIRECTIONS
-        direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
-        directions.append(direction)
 
     #(total_score, x, y, first_direction, previous_direction)
     beam = [
@@ -353,7 +352,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
         discount = ROLLOUT_DISCOUNT ** (step - 1)
 
         for current_score, x, y, first_direction, previous_direction in beam:
-            for direction in directions:
+            for direction in DIRECTIONS:
                 dx, dy = direction
 
                 future_x = x + dx * step_distance
