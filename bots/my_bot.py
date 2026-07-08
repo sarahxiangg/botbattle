@@ -35,10 +35,10 @@ VIRUS_PATH_BUFFER_MULT = 0.75
 SPLIT_VIRUS_BUFFER_MULT = 1.5
 
 # Controlled virus farming
-VIRUS_FARM_MIN_RADIUS = 2.5
+VIRUS_FARM_MIN_RADIUS = 2.2
 VIRUS_FARM_EAT_RATIO = 1.15
-VIRUS_FARM_RANGE_MULT = 4.0
-VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT = 7.0
+VIRUS_FARM_RANGE_MULT = 999
+VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT = 4.5
 VIRUS_FARM_MAX_SPLIT_THREAT = -15000.0
 
 # Anti-jitter
@@ -817,7 +817,14 @@ def override_direction(cache, step_distance):
     if escape_dir is not None:
         return escape_dir
 
-    # 2. Close kill finisher
+    # 2. Controlled virus farming
+    virus_farm_dir = virus_farm_direction(cache, step_distance)
+
+    if virus_farm_dir is not None:
+        cache["virus_farm_mode"] = True
+        return virus_farm_dir
+
+    # 3. Close kill finisher
     kill_dir = close_kill_direction(cache)
 
     if kill_dir is not None:
@@ -848,13 +855,6 @@ def override_direction(cache, step_distance):
 
         if safe_kill:
             return dx, dy
-
-    # 3. Controlled virus farming
-    virus_farm_dir = virus_farm_direction(cache, step_distance)
-
-    if virus_farm_dir is not None:
-        cache["virus_farm_mode"] = True
-        return virus_farm_dir
 
     # 4. Pure food mode
     if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
