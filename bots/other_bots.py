@@ -36,15 +36,22 @@ PREY_VALUE_WEIGHT = 3.0
 PREY_RADIUS_RATIO = 0.82
 
 # Threat / survival scoring.
-THREAT_RADIUS_RATIO = 1.08
+THREAT_RADIUS_RATIO = 1.06
 SAFETY_MARGIN = 2.2
 SPLIT_THREAT_RATIO = 1.65
 SPLIT_REACH_MULT = 3.2
+
+# Counter-split prediction. This is the main anti-"big blob suddenly splits and eats us" mechanism.
+COUNTER_SPLIT_REACTION_MARGIN = 1.4
+COUNTER_SPLIT_DETECTION_MULT = 1.35
+COUNTER_SPLIT_ESCAPE_WEIGHT = 2.4
+COUNTER_SPLIT_MIN_RADIUS_RATIO = 1.55
+
 SURVIVAL_HEADING_STICKINESS = 1.2
 FARM_HEADING_STICKINESS = 18.0
 VIRUS_ROUTE_TARGET_WEIGHT = 4.0
 VIRUS_ROUTE_HEADING_STICKINESS = 1.8
-SURVIVAL_SMOOTHING = 0.28
+SURVIVAL_SMOOTHING = 0.12
 FARMING_SMOOTHING = 0.52
 
 # Split-chase tuning. The engine splits every eligible blob, so we only split
@@ -65,7 +72,7 @@ VIRUS_PATH_MARGIN = 0.2
 
 # Early-game aggressiveness. Higher threat ratio = fewer enemies blocked.
 EARLY_GAME_THRESHOLD = 0.25
-EARLY_THREAT_RATIO = 1.25
+EARLY_THREAT_RATIO = 1.15
 EARLY_FARM_STICKINESS = 7.0
 
 _LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
@@ -451,6 +458,31 @@ def _enemy_split_capture_reach(enemy_child_radius: float) -> float:
     return _split_center_travel(enemy_child_radius) + enemy_child_radius * 0.85
 
 
+def _counter_split_reach(enemy_radius: float, my_radius: float) -> float:
+    """Centre-distance radius where an enemy split child could land on this blob."""
+    if enemy_radius * enemy_radius < SPLIT_MIN_MASS:
+        return 0.0
+
+    enemy_child_radius = math.sqrt((enemy_radius * enemy_radius) / 2.0)
+    if not _can_eat(enemy_child_radius, my_radius):
+        return 0.0
+
+    return _enemy_split_capture_reach(enemy_child_radius) + my_radius + COUNTER_SPLIT_REACTION_MARGIN
+
+
+def _is_counter_split_threat(enemy_radius: float, my_radius: float, center_distance: float) -> tuple[bool, float]:
+    """Return whether enemy can split-kill us soon and the predicted danger reach."""
+    split_reach = _counter_split_reach(enemy_radius, my_radius)
+    if split_reach <= 0.0:
+        return False, 0.0
+
+    # Ratio check catches obvious split threats early.
+    # Distance check catches close enemies even when ratios are barely over threshold.
+    ratio_threat = enemy_radius >= my_radius * COUNTER_SPLIT_MIN_RADIUS_RATIO
+    distance_threat = center_distance <= split_reach * COUNTER_SPLIT_DETECTION_MULT
+    return ratio_threat or distance_threat, split_reach
+
+
 def _split_would_be_punished(
     ctx: _Ctx,
     split_blob,
@@ -575,25 +607,47 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
         for my_blob in ctx.my_blobs:
             my_pos = _blob_pos(my_blob)
             my_radius = _radius(my_blob)
+            to_enemy = enemy_pos - my_pos
+            center_distance = max(0.1, _norm(to_enemy))
             edge_distance = _edge_distance(my_pos, my_radius, enemy_pos, enemy_radius)
 
-            if enemy_radius <= my_radius * threat_ratio:
+            direct_threat = enemy_radius > my_radius * threat_ratio
+            counter_split_threat, counter_split_reach = _is_counter_split_threat(
+                enemy_radius,
+                my_radius,
+                center_distance,
+            )
+
+            if not direct_threat and not counter_split_threat:
                 continue
 
-            can_split_threat = enemy_radius >= my_radius * SPLIT_THREAT_RATIO
-            reach = enemy_radius + my_radius + SAFETY_MARGIN
-            if can_split_threat:
-                enemy_child_radius = math.sqrt((enemy_radius * enemy_radius) / 2.0)
-                if _can_eat(enemy_child_radius, my_radius):
-                    reach += _enemy_split_capture_reach(enemy_child_radius) * SPLIT_REACH_MULT / 3.2
+            direct_reach = enemy_radius + my_radius + SAFETY_MARGIN
+            reach = direct_reach
 
-            detection_distance = reach + my_radius * 4.0
-            if edge_distance <= detection_distance:
+            # The old code only widened the enemy cone once the enemy was already
+            # obviously huge. This predicts the split child's landing zone instead,
+            # so we start dodging before the split actually happens.
+            if counter_split_threat:
+                reach = max(reach, counter_split_reach)
+
+            detection_distance = reach + my_radius * 3.5
+            if counter_split_threat:
+                detection_distance = max(
+                    detection_distance,
+                    counter_split_reach * COUNTER_SPLIT_DETECTION_MULT,
+                )
+
+            if center_distance <= detection_distance or edge_distance <= detection_distance:
                 interval = _danger_cone(my_pos, enemy_pos, reach)
                 if interval is not None:
                     blocked.append(interval)
                     has_threat = True
-                emergency_away.append(-_unit(enemy_pos - my_pos) * (reach / max(0.1, edge_distance)))
+
+                escape_weight = reach / max(0.1, edge_distance)
+                if counter_split_threat:
+                    escape_weight *= COUNTER_SPLIT_ESCAPE_WEIGHT
+
+                emergency_away.append(-_unit(to_enemy) * escape_weight)
 
     split_or_unmerged = _is_multi_or_unmerged(ctx)
 
