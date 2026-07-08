@@ -69,6 +69,12 @@ WALL_DANGER_WEIGHT = 3000.0
 WALL_MARGIN_MULT = 1.2
 OFF_MAP_PENALTY = 1_000_000_000.0
 
+#STUCK_DETECTOR
+LAST_POSITION = None
+STUCK_TICKS = 0
+STUCK_TICK_LIMIT = 4
+STUCK_MOVE_EPS_MULT = 0.05
+
 
 # =========================
 # Cache utilities
@@ -213,21 +219,23 @@ def get_mode_weights(cache):
             "merged_safe_ratio": 1.30,
         }
 
+    # Medium
     if r < 2.5:
         return {
-            "food": FOOD_WEIGHT_MEDIUM,
-            "enemy_danger": 8500.0,
-            "enemy_hunt": 3000.0,
-            "hunt_ratio": 0.85,
-            "merged_safe_ratio": 1.15,
+            "food": 800.0,
+            "enemy_danger": 10000.0,
+            "enemy_hunt": 4500.0,
+            "hunt_ratio": 0.95,
+            "merged_safe_ratio": 1.25,
         }
 
+    # Big
     return {
-        "food": FOOD_WEIGHT_BIG,
-        "enemy_danger": 11000.0,
-        "enemy_hunt": 1500.0,
-        "hunt_ratio": 0.65,
-        "merged_safe_ratio": 0.90,
+        "food": 600.0,
+        "enemy_danger": 13000.0,
+        "enemy_hunt": 3500.0,
+        "hunt_ratio": 0.85,
+        "merged_safe_ratio": 1.10,
     }
 
 
@@ -548,6 +556,59 @@ def enemy_escape_direction(cache, step_distance):
 
     return float(best_direction[0]), float(best_direction[1])
 
+def is_stuck(cache):
+    global LAST_POSITION, STUCK_TICKS
+
+    pos = cache["player_pos"]
+    r = cache["player_radius"]
+
+    if LAST_POSITION is None:
+        LAST_POSITION = pos.copy()
+        return False
+
+    moved = np.linalg.norm(pos - LAST_POSITION)
+
+    if moved < r * STUCK_MOVE_EPS_MULT:
+        STUCK_TICKS += 1
+    else:
+        STUCK_TICKS = 0
+
+    LAST_POSITION = pos.copy()
+
+    return STUCK_TICKS >= STUCK_TICK_LIMIT
+
+def unstuck_direction(cache, weights, step_distance):
+    best_score = -float("inf")
+    best_direction = None
+
+    for direction in DIRECTIONS:
+        dx, dy = direction
+
+        raw_x = cache["player_x"] + dx * step_distance
+        raw_y = cache["player_y"] + dy * step_distance
+
+        future_x, future_y = clamp_position(cache, raw_x, raw_y)
+
+        actual_move = np.linalg.norm(
+            np.array([future_x - cache["player_x"], future_y - cache["player_y"]])
+        )
+
+        # Avoid directions that just push into the wall/corner.
+        if actual_move < step_distance * 0.3:
+            continue
+
+        score = score_position(cache, weights, future_x, future_y)
+        score += enemy_split_threat_score(cache, future_x, future_y)
+
+        if score > best_score:
+            best_score = score
+            best_direction = direction
+
+    if best_direction is None:
+        return None
+
+    return float(best_direction[0]), float(best_direction[1])
+
 
 def override_direction(cache, step_distance):
     # 1. Emergency escape from bigger enemies
@@ -592,6 +653,8 @@ def override_direction(cache, step_distance):
                 return dx, dy
 
     return None
+
+
 
 
 # =========================
@@ -729,6 +792,8 @@ def get_split_decision(move_direction, cache):
 # Direction choice
 # =========================
 
+
+
 def choose_direction(game: Game):
     global LAST_DIRECTION
 
@@ -736,6 +801,14 @@ def choose_direction(game: Game):
     weights = get_mode_weights(cache)
 
     step_distance = STEP_DISTANCE_MULT * cache["player_radius"]
+
+    if is_stuck(cache):
+        unstuck_dir = unstuck_direction(cache, weights, step_distance)
+
+        if unstuck_dir is not None:
+            dx, dy = unstuck_dir
+            LAST_DIRECTION = np.array([dx, dy], dtype=float)
+            return dx, dy, cache
 
     override_dir = override_direction(cache, step_distance)
 
