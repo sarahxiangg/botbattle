@@ -29,9 +29,17 @@ VIRUS_DANGER_WEIGHT = 10000.0
 VIRUS_SAFE_WEIGHT = 0.0
 DANGER_DISTANCE_POWER = 1.3
 
+# Virus hard safety
 VIRUS_HARD_BUFFER_MULT = 0.75
 VIRUS_PATH_BUFFER_MULT = 0.75
 SPLIT_VIRUS_BUFFER_MULT = 1.5
+
+# Controlled virus farming
+VIRUS_FARM_MIN_RADIUS = 2.5
+VIRUS_FARM_EAT_RATIO = 1.15
+VIRUS_FARM_RANGE_MULT = 4.0
+VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT = 7.0
+VIRUS_FARM_MAX_SPLIT_THREAT = -15000.0
 
 # Anti-jitter
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
@@ -91,6 +99,7 @@ def clamp_position(cache, x, y):
     y = min(max(y, r), ARENA_SIZE - r)
 
     return x, y
+
 
 def cap_nearest(locs, max_items, player_pos, *arrays):
     if len(locs) <= max_items:
@@ -189,6 +198,7 @@ def build_cache(game):
         "own_blob_count": own_blob_count,
         "own_locs": own_locs,
         "own_rads": own_rads,
+        "virus_farm_mode": False,
 
         "food_locs": food_locs,
 
@@ -420,16 +430,6 @@ def own_blob_virus_score(cache, dx, dy, step_distance):
 
 
 def wall_score(cache, x, y):
-    # player_radius = cache["player_radius"]
-
-    # if (
-    #     x - player_radius <= 0 or
-    #     x + player_radius >= ARENA_SIZE or
-    #     y - player_radius <= 0 or
-    #     y + player_radius >= ARENA_SIZE
-    # ):
-    #     return -OFF_MAP_PENALTY
-
     return 0.0
 
 
@@ -584,6 +584,90 @@ def close_kill_direction(cache):
     return float(direction[0]), float(direction[1])
 
 
+def dangerous_enemy_near(cache, range_mult):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
+
+    if len(blob_locs) == 0:
+        return False
+
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+
+    dists = np.linalg.norm(blob_locs - player_pos, axis=1)
+    edge_dists = dists - player_radius - blob_rads
+
+    danger_size = np.maximum(blob_rads, merged_rads)
+    dangerous = danger_size > player_radius * 1.05
+    too_close = edge_dists < player_radius * range_mult
+
+    return bool(np.any(dangerous & too_close))
+
+
+def virus_farm_direction(cache, step_distance):
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if len(virus_locs) == 0:
+        return None
+
+    player_radius = cache["player_radius"]
+
+    if player_radius < VIRUS_FARM_MIN_RADIUS:
+        return None
+
+    if cache["own_blob_count"] != 1:
+        return None
+
+    if dangerous_enemy_near(cache, VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT):
+        return None
+
+    player_pos = cache["player_pos"]
+
+    vectors = virus_locs - player_pos
+    dists = np.linalg.norm(vectors, axis=1)
+
+    safe_dists = dists.copy()
+    safe_dists[safe_dists < 1.0] = 1.0
+
+    edge_dists = dists - player_radius - virus_rads
+
+    can_farm = player_radius > virus_rads * VIRUS_FARM_EAT_RATIO
+    close_enough = edge_dists < player_radius * VIRUS_FARM_RANGE_MULT
+
+    candidates = can_farm & close_enough
+
+    if not np.any(candidates):
+        return None
+
+    scores = virus_rads / safe_dists
+    scores[~candidates] = -1.0
+
+    candidate_indices = np.argsort(scores)[::-1]
+
+    for idx in candidate_indices:
+        if scores[idx] <= 0:
+            break
+
+        direction = vectors[idx] / safe_dists[idx]
+
+        dx = float(direction[0])
+        dy = float(direction[1])
+
+        future_x = cache["player_x"] + dx * step_distance
+        future_y = cache["player_y"] + dy * step_distance
+
+        future_x, future_y = clamp_position(cache, future_x, future_y)
+
+        if enemy_split_threat_score(cache, future_x, future_y) <= VIRUS_FARM_MAX_SPLIT_THREAT:
+            continue
+
+        return dx, dy
+
+    return None
+
+
 def enemy_escape_direction(cache, step_distance):
     blob_locs = cache["blob_locs"]
     blob_rads = cache["blob_rads"]
@@ -658,6 +742,7 @@ def enemy_escape_direction(cache, step_distance):
 
     return float(best_direction[0]), float(best_direction[1])
 
+
 def is_stuck(cache):
     global LAST_POSITION, STUCK_TICKS
 
@@ -679,6 +764,7 @@ def is_stuck(cache):
 
     return STUCK_TICKS >= STUCK_TICK_LIMIT
 
+
 def unstuck_direction(cache, weights, step_distance):
     best_score = -float("inf")
     best_direction = None
@@ -695,11 +781,23 @@ def unstuck_direction(cache, weights, step_distance):
             np.array([future_x - cache["player_x"], future_y - cache["player_y"]])
         )
 
-        # Avoid directions that just push into the wall/corner.
         if actual_move < step_distance * 0.3:
             continue
 
         score = score_position(cache, weights, future_x, future_y)
+        score += movement_virus_score(
+            cache,
+            cache["player_x"],
+            cache["player_y"],
+            future_x,
+            future_y,
+        )
+        score += own_blob_virus_score(
+            cache,
+            dx,
+            dy,
+            step_distance,
+        )
         score += enemy_split_threat_score(cache, future_x, future_y)
 
         if score > best_score:
@@ -751,7 +849,14 @@ def override_direction(cache, step_distance):
         if safe_kill:
             return dx, dy
 
-    # 3. Pure food mode
+    # 3. Controlled virus farming
+    virus_farm_dir = virus_farm_direction(cache, step_distance)
+
+    if virus_farm_dir is not None:
+        cache["virus_farm_mode"] = True
+        return virus_farm_dir
+
+    # 4. Pure food mode
     if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
         food_dir = food_direction(cache)
 
@@ -767,8 +872,6 @@ def override_direction(cache, step_distance):
                 return dx, dy
 
     return None
-
-
 
 
 # =========================
@@ -906,8 +1009,6 @@ def get_split_decision(move_direction, cache):
 # Direction choice
 # =========================
 
-
-
 def choose_direction(game: Game):
     global LAST_DIRECTION
 
@@ -1043,10 +1144,14 @@ def main() -> None:
                 try:
                     dx, dy, cache = choose_direction(game)
 
-                    should_do_split, split_direction = get_split_decision(
-                        (dx, dy),
-                        cache,
-                    )
+                    if cache.get("virus_farm_mode", False):
+                        should_do_split = False
+                        split_direction = None
+                    else:
+                        should_do_split, split_direction = get_split_decision(
+                            (dx, dy),
+                            cache,
+                        )
 
                     if should_do_split:
                         sx, sy = split_direction
