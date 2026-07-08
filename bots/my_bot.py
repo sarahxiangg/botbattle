@@ -119,7 +119,7 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     merged_dangerous = (merged_rads > player_radius * 1.25) & (edge_dists < player_radius * 4.0)
 
     bigger = individually_dangerous | merged_dangerous | future_dangerous
-    
+
     # Hunt small blobs unless the enemy's total visible mass is way too large
     EAT_RATIO = 1.12
     CLOSE_KILL_RANGE_MULT = 2.2
@@ -590,8 +590,8 @@ def choose_direction(game: Game) -> tuple[float, float]:
                     position_score += enemy_split_threat_score(
                         cache,
                         player,
-                        x,
-                        y
+                        future_x,
+                        future_y
                     )
 
                 total_score = current_score + discount * position_score
