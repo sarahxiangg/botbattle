@@ -40,10 +40,14 @@ FARMING_SMOOTHING = 0.65
 EARLY_GAME_THRESHOLD = 0.25   # first 25% of rounds counts as early game
 EARLY_THREAT_RATIO = 1.3      # higher = fewer angles blocked → more aggressive movement
 EARLY_FARM_STICKINESS = 8.0   # lower = faster pivots to chase food/prey
+EARLY_FARMING_SMOOTHING = 0.4  # less smoothing → faster pivots in early game (vs FARMING_SMOOTHING 0.65)
+EARLY_FOOD_VALUE_WEIGHT = 9.0  # stronger food pull in early game to grow faster before competition
 
 # Arena edge avoidance (arena is 60×60; coordinates go from 0 to ARENA_SIZE)
 EDGE_AVOID_MARGIN = 6.0       # wall danger activates within this distance of player center
-EDGE_BLOCK_RADIUS = 3.5       # virtual radius for wall danger-cone calculation
+# NOTE: EDGE_BLOCK_RADIUS is no longer used; wall cones are now computed with a linear formula.
+FLEE_DIRECTION_WEIGHT = 2.5   # how strongly to bias safe-angle selection toward escape direction
+VIRUS_SHIELD_MIN_ALIGNMENT = 0.4  # dot-product threshold: virus must be roughly between us and chaser
 
 # Merge drive: converge split blobs once merge cooldown expires
 MERGE_PULL_WEIGHT = 85.0      # goal score weight for blob convergence direction
@@ -52,6 +56,10 @@ MERGE_READY_COOLDOWN = 3      # merge_cooldown threshold to count a blob as merg
 # Prey hunting urgency scales with size (mass decay = 0.002/tick; large blobs bleed mass)
 LARGE_RADIUS_THRESHOLD = 3.0  # radius above which prey-score bonus activates
 LARGE_PREY_BONUS = 2.0        # max prey-score multiplier when at or above threshold
+
+# Post-split vulnerability: while children cannot merge, detection is tighter
+POST_SPLIT_DANGER_ROUNDS = 20  # rounds after split where threat detection is tightened
+POST_SPLIT_THREAT_RATIO = 1.02  # near-parity enemies become threats (vs THREAT_RADIUS_RATIO 1.08)
 
 _LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
 _LAST_SPLIT_ROUND: int = -9999
@@ -492,6 +500,9 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
 
     # Higher threat_ratio → fewer enemies trigger avoidance → more aggressive movement.
     threat_ratio = THREAT_RADIUS_RATIO if ctx.round_frac > EARLY_GAME_THRESHOLD else EARLY_THREAT_RATIO
+    # Post-split: children are smaller and more vulnerable; tighten detection for ~2 sec.
+    if ctx.round_index - _LAST_SPLIT_ROUND < POST_SPLIT_DANGER_ROUNDS:
+        threat_ratio = min(threat_ratio, POST_SPLIT_THREAT_RATIO)
 
     # Per-blob enemy danger: check each owned blob against each enemy blob.
     # After splitting, a child blob may be threatened even if the merged centroid looks safe.
@@ -544,41 +555,108 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
                 if interval is not None:
                     blocked.append(interval)
 
-    # Wall avoidance: treat arena boundaries as virtual obstacles.
-    # Engine clamps blobs to [radius, arena_size - radius], so walls are at 0 and arena_size.
+    # Wall avoidance: block angles pointing toward nearby walls using a linear cone.
+    # BUG in old code: _danger_cone(player_pos, wall_pt, EDGE_BLOCK_RADIUS=3.5) called
+    # asin(3.5/dist), which CLAMPS to asin(1)=90° whenever dist < 3.5. In a corner both
+    # walls could block 180° each → 270°+ blocked by walls alone, causing the bot to thrash.
+    # Fix: half_angle = π/2 * (1 - dist/EDGE_AVOID_MARGIN) gives a smooth linear ramp:
+    #   at wall face (dist→0): block ±90°  |  at margin (dist=MARGIN): block 0°
     if ctx.arena_size > 0:
+        S = ctx.arena_size
         px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
-        for wall_pt in (
-            np.array([0.0, py]),
-            np.array([ctx.arena_size, py]),
-            np.array([px, 0.0]),
-            np.array([px, ctx.arena_size]),
+
+        for dist_to_wall, wall_angle in (
+            (px,      math.pi),            # left wall:   block westward angles
+            (S - px,  0.0),                # right wall:  block eastward angles
+            (py,      3.0 * math.pi / 2),  # bottom wall: block southward angles
+            (S - py,  math.pi / 2),        # top wall:    block northward angles
         ):
-            dist = _norm(wall_pt - ctx.player_pos)
-            if 0 < dist < EDGE_AVOID_MARGIN:
-                interval = _danger_cone(ctx.player_pos, wall_pt, EDGE_BLOCK_RADIUS)
-                if interval is not None:
-                    blocked.append(interval)
-                # Push emergency escape vectors away from wall
+            if 0 < dist_to_wall < EDGE_AVOID_MARGIN:
+                # Linear ramp: wide near wall, zero at the margin boundary.
+                half_angle = (math.pi / 2) * (1.0 - dist_to_wall / EDGE_AVOID_MARGIN)
+                if half_angle > 0.02:
+                    interval = _blocked_interval(wall_angle, half_angle)
+                    if interval is not None:
+                        blocked.append(interval)
+                # Emergency push: unit vector directly away from the wall.
+                escape_angle = (wall_angle + math.pi) % TAU
                 emergency_away.append(
-                    _unit(ctx.player_pos - wall_pt) * (EDGE_AVOID_MARGIN / max(1.0, dist))
+                    np.array([math.cos(escape_angle), math.sin(escape_angle)])
+                    * (EDGE_AVOID_MARGIN / max(1.0, dist_to_wall))
                 )
 
     return blocked, emergency_away, has_threat
+
+
+def _virus_shield_direction(ctx: _Ctx) -> np.ndarray | None:
+    """Return a unit vector toward a virus we can use as a running shield.
+
+    Logic: the virus is too large for us to pop (we'd get split), but a threatening
+    enemy CAN pop it. Running through the virus forces the enemy to either detour
+    (we gain separation) or follow and get split (we gain mass advantage).
+    """
+    for virus in ctx.visible_viruses:
+        virus_pos = _pos(virus)
+        virus_radius = _radius(virus)
+
+        # Conservative safety check: if our merged radius can't pop it, no child can either.
+        if _can_consume_virus(ctx.player_radius, virus_radius):
+            continue
+
+        to_virus = virus_pos - ctx.player_pos
+        virus_dist = _norm(to_virus)
+        if virus_dist < 1e-6:
+            continue
+        to_virus_unit = to_virus / virus_dist
+
+        for enemy in ctx.visible_blobs:
+            if enemy.player_id == ctx.player_id:
+                continue
+            enemy_pos = _pos(enemy)
+            enemy_radius = _radius(enemy)
+            if enemy_radius <= ctx.player_radius * THREAT_RADIUS_RATIO:
+                continue  # not actually dangerous
+            if not _can_consume_virus(enemy_radius, virus_radius):
+                continue  # enemy wouldn't pop the virus; no deterrent value
+
+            to_enemy = enemy_pos - ctx.player_pos
+            enemy_dist = _norm(to_enemy)
+            if enemy_dist < 1e-6:
+                continue
+
+            # Virus must be closer than the enemy and roughly in the same direction.
+            if (virus_dist < enemy_dist and
+                    float(np.dot(to_virus_unit, to_enemy / enemy_dist)) > VIRUS_SHIELD_MIN_ALIGNMENT):
+                return to_virus_unit
+
+    return None
 
 
 def _best_safe_angle(
     ctx: _Ctx,
     gaps: list[tuple[float, float]],
     previous_angle: float,
+    emergency_away: list[np.ndarray],
 ) -> float:
     best_angle = gaps[0][0] + gaps[0][1] / 2.0
     best_score = -float("inf")
+
+    # Pre-compute aggregate flee direction once for scoring and candidate generation.
+    flee_angle: float | None = None
+    if emergency_away:
+        flee_sum = np.sum(emergency_away, axis=0)
+        flee_len = _norm(flee_sum)
+        if flee_len > 1e-6:
+            flee_angle = _angle_of(flee_sum / flee_len)
 
     candidate_angles: list[float] = []
     for gap in gaps:
         candidate_angles.append((gap[0] + gap[1] / 2.0) % TAU)
         candidate_angles.append(_shift_into_gap(previous_angle, gap, previous_angle))
+
+        # Explicit escape direction: ensures we consider fleeing even with no food nearby.
+        if flee_angle is not None:
+            candidate_angles.append(_shift_into_gap(flee_angle, gap, flee_angle))
 
         for cluster in ctx.food_clusters:
             candidate_angles.append(
@@ -601,7 +679,12 @@ def _best_safe_angle(
         gap = max(containing_gaps, key=lambda item: item[1])
         centeredness = math.cos(_angle_diff(angle, (gap[0] + gap[1] / 2.0) % TAU))
         heading_stickiness = SURVIVAL_HEADING_STICKINESS * math.cos(_angle_diff(angle, previous_angle))
-        score = gap[1] * 2.0 + centeredness + heading_stickiness + _target_score(angle, ctx)
+        # Reward angles that align with the weighted escape direction.
+        flee_score = (
+            FLEE_DIRECTION_WEIGHT * math.cos(_angle_diff(angle, flee_angle))
+            if flee_angle is not None else 0.0
+        )
+        score = gap[1] * 2.0 + centeredness + heading_stickiness + flee_score + _target_score(angle, ctx)
 
         if score > best_score:
             best_score = score
@@ -613,8 +696,9 @@ def _best_safe_angle(
 def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
     best_angle = previous_angle
     best_score = -float("inf")
-    # Early game: lower stickiness → faster pivots to chase food/prey
+    # Early game: lower stickiness → faster pivots; higher food weight → faster growth
     farm_stickiness = FARM_HEADING_STICKINESS if ctx.round_frac > EARLY_GAME_THRESHOLD else EARLY_FARM_STICKINESS
+    food_weight = FOOD_VALUE_WEIGHT if ctx.round_frac > EARLY_GAME_THRESHOLD else EARLY_FOOD_VALUE_WEIGHT
     # Large blobs decay at 0.2%/tick: proportionally boost prey attraction to compensate
     prey_mult = (
         min(LARGE_PREY_BONUS, LARGE_PREY_BONUS * ctx.player_radius / LARGE_RADIUS_THRESHOLD)
@@ -627,7 +711,7 @@ def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
         angle = _angle_of(to_cluster)
         heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
         score = (
-            cluster["value"] * FOOD_VALUE_WEIGHT
+            cluster["value"] * food_weight
             + cluster["count"] * 8.0
             + (cluster["value"] / distance) * 12.0
             - distance * 0.45
@@ -718,7 +802,14 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
     cur_round = int(getattr(game.state, "round", 0) or 0)
     max_rounds = int(getattr(game.state, "max_rounds", 1) or 1)
     round_frac = cur_round / max(1, max_rounds)
-    arena_size = float(getattr(game.state.map, "size", 0) or 0)
+    # Use a safe accessor for arena_size; fall back to known constant 60.0.
+    arena_size = 60.0
+    try:
+        arena_size = float(game.state.map.size or 60.0)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    # Early game: faster direction pivots to chase food; reverts to FARMING_SMOOTHING mid-game.
+    farming_smoothing = FARMING_SMOOTHING if round_frac > EARLY_GAME_THRESHOLD else EARLY_FARMING_SMOOTHING
 
     visible_blobs = list(game.state.visible_blobs or [])
     visible_food = list(game.state.visible_food or [])
@@ -746,7 +837,13 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
 
     if has_threat:
         if gaps:
-            angle = _best_safe_angle(ctx, gaps, previous_angle)
+            # Virus shield: if a virus sits between us and a threatening enemy,
+            # route through it — the enemy pops it (gets split) or detours (we gain distance).
+            virus_shield = _virus_shield_direction(ctx)
+            if virus_shield is not None and _angle_is_safe(_angle_of(virus_shield), gaps, blocked):
+                dx, dy = _smoothed_direction(virus_shield, SURVIVAL_SMOOTHING)
+                return dx, dy, False
+            angle = _best_safe_angle(ctx, gaps, previous_angle, emergency_away)
             dx, dy = _smoothed_direction(np.array(_angle_to_vec(angle)), SURVIVAL_SMOOTHING)
             return dx, dy, False
 
@@ -763,13 +860,13 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
 
     best_angle, found_goal = _best_goal_angle(ctx, previous_angle)
     if not found_goal:
-        dx, dy = _smoothed_direction(np.array([1.0, 0.0]), FARMING_SMOOTHING)
+        dx, dy = _smoothed_direction(np.array([1.0, 0.0]), farming_smoothing)
         return dx, dy, False
 
     if blocked and gaps:
         best_angle = _best_routed_goal_angle(ctx, gaps, best_angle, previous_angle)
 
-    dx, dy = _smoothed_direction(np.array(_angle_to_vec(best_angle)), FARMING_SMOOTHING)
+    dx, dy = _smoothed_direction(np.array(_angle_to_vec(best_angle)), farming_smoothing)
     return dx, dy, False
 
 
