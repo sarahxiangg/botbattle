@@ -24,6 +24,9 @@ FOOD_WEIGHT_SMALL = 1200.0
 FOOD_WEIGHT_MEDIUM = 900.0
 FOOD_WEIGHT_BIG = 700.0
 
+FOOD_RUSH_MAX_RADIUS = 2.2
+FOOD_RUSH_ENEMY_DANGER_RANGE_MULT = 3.0
+
 ENEMY_DANGER_WEIGHT = 13000.0
 VIRUS_DANGER_WEIGHT = 10000.0
 VIRUS_SAFE_WEIGHT = 0.0
@@ -36,10 +39,10 @@ SPLIT_VIRUS_BUFFER_MULT = 1.5
 
 # Controlled virus farming
 VIRUS_FARM_MIN_RADIUS = 2.2
-VIRUS_FARM_EAT_RATIO = 1.15
-VIRUS_FARM_RANGE_MULT = 999
-VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT = 4.5
-VIRUS_FARM_MAX_SPLIT_THREAT = -15000.0
+VIRUS_FARM_EAT_RATIO = 1.10
+VIRUS_FARM_RANGE_MULT = 999.0
+VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT = 0.0
+VIRUS_FARM_MAX_SPLIT_THREAT = -1_000_000_000.0
 
 # Anti-jitter
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
@@ -620,9 +623,6 @@ def virus_farm_direction(cache, step_distance):
     if cache["own_blob_count"] != 1:
         return None
 
-    if dangerous_enemy_near(cache, VIRUS_FARM_ENEMY_CLEAR_RANGE_MULT):
-        return None
-
     player_pos = cache["player_pos"]
 
     vectors = virus_locs - player_pos
@@ -641,31 +641,15 @@ def virus_farm_direction(cache, step_distance):
     if not np.any(candidates):
         return None
 
-    scores = virus_rads / safe_dists
+    # Prefer nearest farmable virus.
+    scores = 1.0 / safe_dists
     scores[~candidates] = -1.0
 
-    candidate_indices = np.argsort(scores)[::-1]
+    idx = int(np.argmax(scores))
 
-    for idx in candidate_indices:
-        if scores[idx] <= 0:
-            break
+    direction = vectors[idx] / safe_dists[idx]
 
-        direction = vectors[idx] / safe_dists[idx]
-
-        dx = float(direction[0])
-        dy = float(direction[1])
-
-        future_x = cache["player_x"] + dx * step_distance
-        future_y = cache["player_y"] + dy * step_distance
-
-        future_x, future_y = clamp_position(cache, future_x, future_y)
-
-        if enemy_split_threat_score(cache, future_x, future_y) <= VIRUS_FARM_MAX_SPLIT_THREAT:
-            continue
-
-        return dx, dy
-
-    return None
+    return float(direction[0]), float(direction[1])
 
 
 def enemy_escape_direction(cache, step_distance):
@@ -856,22 +840,35 @@ def override_direction(cache, step_distance):
         if safe_kill:
             return dx, dy
 
-    # 4. Pure food mode
-    if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
-        food_dir = food_direction(cache)
+    # 4. Early food rush mode
+    if cache["player_radius"] <= FOOD_RUSH_MAX_RADIUS:
+        if not dangerous_enemy_near(cache, FOOD_RUSH_ENEMY_DANGER_RANGE_MULT):
+            food_dir = food_direction(cache)
 
-        if food_dir is not None:
-            dx, dy = food_dir
+            if food_dir is not None:
+                dx, dy = food_dir
 
-            future_x = cache["player_x"] + dx * step_distance
-            future_y = cache["player_y"] + dy * step_distance
+                future_x = cache["player_x"] + dx * step_distance
+                future_y = cache["player_y"] + dy * step_distance
 
-            future_x, future_y = clamp_position(cache, future_x, future_y)
+                future_x, future_y = clamp_position(cache, future_x, future_y)
 
-            if wall_score(cache, future_x, future_y) > -OFF_MAP_PENALTY / 2:
-                return dx, dy
-
-    return None
+                if (
+                    movement_virus_score(
+                        cache,
+                        cache["player_x"],
+                        cache["player_y"],
+                        future_x,
+                        future_y,
+                    ) > -OFF_MAP_PENALTY / 2 and
+                    own_blob_virus_score(
+                        cache,
+                        dx,
+                        dy,
+                        step_distance,
+                    ) > -OFF_MAP_PENALTY / 2
+                ):
+                    return dx, dy
 
 
 # =========================
