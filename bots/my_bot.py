@@ -6,9 +6,14 @@ from lib.models.penguin_model import DirectionModel
 import numpy as np
 
 import sys 
+import time
 import inspect
 
-print("MovePlayer signature:", inspect.signature(MovePlayer), file=sys.stderr, flush=True)
+start = time.perf_counter()
+dx, dy = choose_direction(game)
+elapsed = time.perf_counter() - start
+print(f"TURN TIME: {elapsed:.4f}s", file=sys.stderr, flush=True)
+
 # =========================
 # Direction search
 # =========================
