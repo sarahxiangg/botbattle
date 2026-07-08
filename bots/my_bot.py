@@ -40,6 +40,22 @@ FOOD_RUSH_MAX_RADIUS = 2.2
 FOOD_TARGET_REACHED_DIST_MULT = 0.40
 FOOD_TARGET_REACHED_MIN = 0.35
 
+FOOD_TARGET_KEY = None
+FOOD_TARGET_TICKS = 0
+FOOD_TARGET_NO_PROGRESS = 0
+FOOD_TARGET_LAST_DIST = None
+FOOD_BLACKLIST = {}
+
+FOOD_TARGET_MAX_TICKS = 10
+FOOD_NO_PROGRESS_LIMIT = 4
+FOOD_BLACKLIST_TICKS = 25
+FOOD_CORNER_MARGIN = 0.45
+
+FOOD_CLUSTER_RADIUS = 4.0
+FOOD_CLUSTER_WEIGHT = 0.55
+FOOD_DISTANCE_POWER = 1.15
+FOOD_MIN_TARGET_DIST = 0.15
+
 # Danger override
 DANGER_OVERRIDE_RANGE_MULT = 9.0
 DANGER_DIRECT_RATIO = 1.06
@@ -47,6 +63,8 @@ DANGER_SPLIT_RATIO = 1.08
 DANGER_SPLIT_RANGE_MULT = 5.0
 DANGER_OVERRIDE_WEIGHT = 120000.0
 DANGER_DISTANCE_POWER = 1.2
+DANGER_WALL_PUSH_PENALTY = 50000.0
+DANGER_MOVE_REWARD = 5000.0
 
 # Normal scoring
 FOOD_SCORE_WEIGHT = 900.0
@@ -476,8 +494,24 @@ def danger_avoidance_override(cache, step_distance):
         if virus_score <= -OFF_MAP_PENALTY / 2:
             continue
 
+        future_x = cache["player_x"] + dx * step_distance
+        future_y = cache["player_y"] + dy * step_distance
+        future_x, future_y = clamp_position(cache, future_x, future_y)
+
+        actual_move = np.linalg.norm(
+            np.array([
+                future_x - cache["player_x"],
+                future_y - cache["player_y"],
+            ], dtype=float)
+        )
+
         score = virus_score
         score += direction_enemy_danger_score(cache, dx, dy, step_distance)
+
+        if actual_move < step_distance * 0.20:
+            score -= DANGER_WALL_PUSH_PENALTY
+        else:
+            score += DANGER_MOVE_REWARD * actual_move
 
         if score > best_score:
             best_score = score
@@ -502,48 +536,148 @@ def danger_avoidance_override(cache, step_distance):
 # Override 2: food farming
 # =========================
 
+def food_key(food_pos):
+    return (round(float(food_pos[0]), 1), round(float(food_pos[1]), 1))
+
+
+def update_food_blacklist():
+    global FOOD_BLACKLIST
+
+    expired = []
+
+    for key in FOOD_BLACKLIST:
+        FOOD_BLACKLIST[key] -= 1
+
+        if FOOD_BLACKLIST[key] <= 0:
+            expired.append(key)
+
+    for key in expired:
+        del FOOD_BLACKLIST[key]
+
+
+def blacklist_food_key(key):
+    global FOOD_TARGET_KEY, FOOD_TARGET_TICKS
+    global FOOD_TARGET_NO_PROGRESS, FOOD_TARGET_LAST_DIST
+
+    if key is None:
+        return
+
+    FOOD_BLACKLIST[key] = FOOD_BLACKLIST_TICKS
+
+    if FOOD_TARGET_KEY == key:
+        FOOD_TARGET_KEY = None
+        FOOD_TARGET_TICKS = 0
+        FOOD_TARGET_NO_PROGRESS = 0
+        FOOD_TARGET_LAST_DIST = None
+
+
+def food_in_unreachable_corner(food_pos):
+    x, y = food_pos
+
+    near_left = x < FOOD_CORNER_MARGIN
+    near_right = ARENA_SIZE - x < FOOD_CORNER_MARGIN
+    near_bottom = y < FOOD_CORNER_MARGIN
+    near_top = ARENA_SIZE - y < FOOD_CORNER_MARGIN
+
+    return (near_left or near_right) and (near_bottom or near_top)
+
+
 def ranked_food_directions(cache):
+    global FOOD_TARGET_KEY, FOOD_TARGET_TICKS
+    global FOOD_TARGET_NO_PROGRESS, FOOD_TARGET_LAST_DIST
+
+    update_food_blacklist()
+
     food_locs = cache["food_locs"]
 
     if len(food_locs) == 0:
+        FOOD_TARGET_KEY = None
+        FOOD_TARGET_TICKS = 0
+        FOOD_TARGET_NO_PROGRESS = 0
+        FOOD_TARGET_LAST_DIST = None
         return []
 
     player_pos = cache["player_pos"]
-    player_radius = cache["player_radius"]
 
-    target_locs = []
+    food_keys = [food_key(food_pos) for food_pos in food_locs]
 
-    for food_pos in food_locs:
-        tx, ty = clamp_point_for_radius(
-            food_pos[0],
-            food_pos[1],
-            player_radius,
-        )
-        target_locs.append([tx, ty])
+    current_idx = None
 
-    target_locs = np.array(target_locs, dtype=float)
+    if FOOD_TARGET_KEY is not None:
+        for i, key in enumerate(food_keys):
+            if key == FOOD_TARGET_KEY:
+                current_idx = i
+                break
 
-    vectors = target_locs - player_pos
+        if current_idx is None:
+            FOOD_TARGET_KEY = None
+            FOOD_TARGET_TICKS = 0
+            FOOD_TARGET_NO_PROGRESS = 0
+            FOOD_TARGET_LAST_DIST = None
+
+    vectors = food_locs - player_pos
     dists = np.linalg.norm(vectors, axis=1)
 
     reached_dist = max(
         FOOD_TARGET_REACHED_MIN,
-        player_radius * FOOD_TARGET_REACHED_DIST_MULT,
+        cache["player_radius"] * FOOD_TARGET_REACHED_DIST_MULT,
     )
 
-    # Key fix:
-    # if we are already close to the reachable point for this food,
-    # do not keep targeting it forever.
-    valid = dists > reached_dist
+    valid = dists > FOOD_MIN_TARGET_DIST
+
+    for i, key in enumerate(food_keys):
+        if key in FOOD_BLACKLIST:
+            valid[i] = False
+
+        if food_in_unreachable_corner(food_locs[i]):
+            valid[i] = False
 
     if not np.any(valid):
         return []
 
+    # Progress tracking for current target.
+    if current_idx is not None and valid[current_idx]:
+        current_dist = dists[current_idx]
+
+        FOOD_TARGET_TICKS += 1
+
+        if FOOD_TARGET_LAST_DIST is not None:
+            if current_dist >= FOOD_TARGET_LAST_DIST - 0.03:
+                FOOD_TARGET_NO_PROGRESS += 1
+            else:
+                FOOD_TARGET_NO_PROGRESS = 0
+
+        FOOD_TARGET_LAST_DIST = current_dist
+
+        if (
+            current_dist < reached_dist or
+            FOOD_TARGET_TICKS >= FOOD_TARGET_MAX_TICKS or
+            FOOD_TARGET_NO_PROGRESS >= FOOD_NO_PROGRESS_LIMIT
+        ):
+            blacklist_food_key(FOOD_TARGET_KEY)
+            current_idx = None
+
     safe_dists = dists.copy()
     safe_dists[safe_dists < 1.0] = 1.0
 
-    scores = np.full(len(dists), -1.0)
-    scores[valid] = 1.0 / safe_dists[valid]
+    pairwise = np.linalg.norm(
+        food_locs[:, None, :] - food_locs[None, :, :],
+        axis=2,
+    )
+
+    cluster_density = np.exp(
+        -((pairwise / FOOD_CLUSTER_RADIUS) ** 2)
+    ).sum(axis=1) - 1.0
+
+    scores = (
+        (1.0 + FOOD_CLUSTER_WEIGHT * cluster_density) /
+        (safe_dists ** FOOD_DISTANCE_POWER)
+    )
+
+    scores[~valid] = -1.0
+
+    if current_idx is not None and scores[current_idx] > 0:
+        scores[current_idx] *= 1.25
 
     candidate_indices = np.argsort(scores)[::-1]
 
@@ -563,8 +697,15 @@ def ranked_food_directions(cache):
                 float(scores[idx]),
                 float(direction[0]),
                 float(direction[1]),
+                food_keys[idx],
             )
         )
+
+    if candidates and FOOD_TARGET_KEY is None:
+        FOOD_TARGET_KEY = candidates[0][3]
+        FOOD_TARGET_TICKS = 0
+        FOOD_TARGET_NO_PROGRESS = 0
+        FOOD_TARGET_LAST_DIST = None
 
     return candidates
 
@@ -578,23 +719,20 @@ def food_farming_override(cache, step_distance):
     if not food_candidates:
         return None
 
-    for _, dx, dy in food_candidates:
+    for _, dx, dy, key in food_candidates:
         future_x = cache["player_x"] + dx * step_distance
         future_y = cache["player_y"] + dy * step_distance
         future_x, future_y = clamp_position(cache, future_x, future_y)
 
         actual_move = np.linalg.norm(
-            np.array(
-                [
-                    future_x - cache["player_x"],
-                    future_y - cache["player_y"],
-                ],
-                dtype=float,
-            )
+            np.array([
+                future_x - cache["player_x"],
+                future_y - cache["player_y"],
+            ], dtype=float)
         )
 
-        # Avoid directions that mostly just push into the wall.
-        if actual_move < step_distance * 0.25:
+        if actual_move < step_distance * 0.20:
+            blacklist_food_key(key)
             continue
 
         if movement_virus_score(
@@ -604,12 +742,15 @@ def food_farming_override(cache, step_distance):
             future_x,
             future_y,
         ) <= -OFF_MAP_PENALTY / 2:
+            blacklist_food_key(key)
             continue
 
         if own_blob_virus_score(cache, dx, dy, step_distance) <= -OFF_MAP_PENALTY / 2:
+            blacklist_food_key(key)
             continue
 
         if not move_safe_from_enemies(cache, dx, dy, step_distance):
+            blacklist_food_key(key)
             continue
 
         return dx, dy, False
@@ -692,8 +833,6 @@ def close_kill_override(cache, step_distance):
 
     useful_target = blob_rads > player_radius * SPLIT_TARGET_MIN_RADIUS_MULT
 
-    # Realistic hit reach:
-    # split piece travels split_range, and can collide using split_radius + target_radius.
     hit_reach = split_range * SPLIT_RANGE_SAFETY_MULT + split_radius + blob_rads
 
     split_candidates = (
@@ -960,6 +1099,7 @@ def unstuck_override(cache, step_distance):
 
     return float(best_direction[0]), float(best_direction[1]), False
 
+
 def override_direction(cache, step_distance):
     # 1. Most important: avoid enemies at all costs.
     danger_dir = danger_avoidance_override(cache, step_distance)
@@ -999,21 +1139,8 @@ def override_direction(cache, step_distance):
 # =========================
 
 def wall_score(cache, x, y):
-    r = cache["player_radius"]
+    return 0.0
 
-    nearest_wall = min(
-        x - r,
-        ARENA_SIZE - x - r,
-        y - r,
-        ARENA_SIZE - y - r,
-    )
-
-    if nearest_wall >= WALL_BUFFER:
-        return 0.0
-
-    closeness = (WALL_BUFFER - nearest_wall) / max(WALL_BUFFER, 1e-9)
-
-    return -WALL_PENALTY_WEIGHT * (closeness ** 2)
 
 def food_score(cache, x, y):
     food_locs = cache["food_locs"]
