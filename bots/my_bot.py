@@ -29,6 +29,10 @@ VIRUS_DANGER_WEIGHT = 10000.0
 VIRUS_SAFE_WEIGHT = 0.0
 DANGER_DISTANCE_POWER = 1.3
 
+VIRUS_HARD_BUFFER_MULT = 0.75
+VIRUS_PATH_BUFFER_MULT = 0.75
+SPLIT_VIRUS_BUFFER_MULT = 1.5
+
 # Anti-jitter
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
 SMOOTHING = 0.0 #0.10
@@ -43,7 +47,7 @@ BEAM_WIDTH = 1
 
 MAX_FOOD_CONSIDERED = 25
 MAX_BLOBS_CONSIDERED = 30
-MAX_VIRUSES_CONSIDERED = 10
+MAX_VIRUSES_CONSIDERED = 999
 
 # Eating / hunting
 EAT_RATIO = 1.12
@@ -109,7 +113,17 @@ def build_cache(game):
     player_pos = np.array([me.x, me.y], dtype=float)
     player_radius = float(me.radius)
     player_id = me.player_id
-    own_blob_count = len(me.blobs)
+
+    own_blobs = list(me.blobs.values())
+
+    if own_blobs:
+        own_locs = np.array([blob.pos for blob in own_blobs], dtype=float)
+        own_rads = np.array([blob.radius for blob in own_blobs], dtype=float)
+    else:
+        own_locs = np.array([[me.x, me.y]], dtype=float)
+        own_rads = np.array([me.radius], dtype=float)
+
+    own_blob_count = len(own_blobs)
 
     # ---------- FOOD ----------
     foods = game.state.visible_food
@@ -162,14 +176,6 @@ def build_cache(game):
     if viruses:
         virus_locs = np.array([virus.pos for virus in viruses], dtype=float)
         virus_rads = np.array([virus.radius for virus in viruses], dtype=float)
-
-        if len(virus_locs) > MAX_VIRUSES_CONSIDERED:
-            virus_locs, virus_rads = cap_nearest(
-                virus_locs,
-                MAX_VIRUSES_CONSIDERED,
-                player_pos,
-                virus_rads,
-            )
     else:
         virus_locs = np.empty((0, 2), dtype=float)
         virus_rads = np.empty(0, dtype=float)
@@ -181,6 +187,8 @@ def build_cache(game):
         "player_radius": player_radius,
         "player_id": player_id,
         "own_blob_count": own_blob_count,
+        "own_locs": own_locs,
+        "own_rads": own_rads,
 
         "food_locs": food_locs,
 
@@ -323,7 +331,7 @@ def virus_score(cache, future_x, future_y, danger_weight):
 
     dangerous = player_radius > virus_rads * 1.1
 
-    if np.any(dangerous & (edge_dists < player_radius * 0.25)):
+    if np.any(dangerous & (edge_dists < player_radius * VIRUS_HARD_BUFFER_MULT)):
         return -OFF_MAP_PENALTY
 
     edge_dists[edge_dists < 1.0] = 1.0
@@ -331,6 +339,84 @@ def virus_score(cache, future_x, future_y, danger_weight):
     danger_scores = danger_weight / (edge_dists ** 3)
 
     return -float(np.sum(danger_scores[dangerous]))
+
+
+def segment_virus_score(cache, start_pos, end_pos, moving_radius, buffer_mult):
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if len(virus_locs) == 0:
+        return 0.0
+
+    dangerous = moving_radius > virus_rads * 1.1
+
+    if not np.any(dangerous):
+        return 0.0
+
+    segment = end_pos - start_pos
+    segment_len_sq = np.dot(segment, segment)
+
+    if segment_len_sq <= 1e-9:
+        dists = np.linalg.norm(virus_locs - start_pos, axis=1)
+    else:
+        to_viruses = virus_locs - start_pos
+        t = np.sum(to_viruses * segment, axis=1) / segment_len_sq
+        t = np.clip(t, 0.0, 1.0)
+
+        closest_points = start_pos + t.reshape(-1, 1) * segment
+        dists = np.linalg.norm(virus_locs - closest_points, axis=1)
+
+    clearances = dists - moving_radius - virus_rads
+
+    if np.any(dangerous & (clearances < moving_radius * buffer_mult)):
+        return -OFF_MAP_PENALTY
+
+    clearances[clearances < 1.0] = 1.0
+
+    return -float(np.sum(VIRUS_DANGER_WEIGHT / (clearances[dangerous] ** 3)))
+
+
+def movement_virus_score(cache, start_x, start_y, end_x, end_y):
+    start_pos = np.array([start_x, start_y], dtype=float)
+    end_pos = np.array([end_x, end_y], dtype=float)
+
+    return segment_virus_score(
+        cache,
+        start_pos,
+        end_pos,
+        cache["player_radius"],
+        VIRUS_PATH_BUFFER_MULT,
+    )
+
+
+def own_blob_virus_score(cache, dx, dy, step_distance):
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+
+    if len(own_locs) <= 1:
+        return 0.0
+
+    delta = np.array([dx * step_distance, dy * step_distance], dtype=float)
+
+    total_score = 0.0
+
+    for own_pos, own_radius in zip(own_locs, own_rads):
+        end_pos = own_pos + delta
+
+        score = segment_virus_score(
+            cache,
+            own_pos,
+            end_pos,
+            own_radius,
+            VIRUS_PATH_BUFFER_MULT,
+        )
+
+        if score <= -OFF_MAP_PENALTY / 2:
+            return -OFF_MAP_PENALTY
+
+        total_score += score
+
+    return total_score
 
 
 def wall_score(cache, x, y):
@@ -545,6 +631,22 @@ def enemy_escape_direction(cache, step_distance):
 
         score += enemy_split_threat_score(cache, future_x, future_y)
         score += virus_score(cache, future_x, future_y, VIRUS_DANGER_WEIGHT)
+
+        score += movement_virus_score(
+            cache,
+            cache["player_x"],
+            cache["player_y"],
+            future_x,
+            future_y,
+        )
+
+        score += own_blob_virus_score(
+            cache,
+            dx,
+            dy,
+            step_distance,
+        )
+
         score += wall_score(cache, future_x, future_y)
 
         if score > best_score:
@@ -629,9 +731,21 @@ def override_direction(cache, step_distance):
         future_x, future_y = clamp_position(cache, future_x, future_y)
 
         safe_kill = (
-            wall_score(cache, future_x, future_y) != -OFF_MAP_PENALTY and
             enemy_split_threat_score(cache, future_x, future_y) > -20000 and
-            virus_score(cache, future_x, future_y, VIRUS_DANGER_WEIGHT) > -OFF_MAP_PENALTY / 2
+            virus_score(cache, future_x, future_y, VIRUS_DANGER_WEIGHT) > -OFF_MAP_PENALTY / 2 and
+            movement_virus_score(
+                cache,
+                cache["player_x"],
+                cache["player_y"],
+                future_x,
+                future_y,
+            ) > -OFF_MAP_PENALTY / 2 and
+            own_blob_virus_score(
+                cache,
+                dx,
+                dy,
+                step_distance,
+            ) > -OFF_MAP_PENALTY / 2
         )
 
         if safe_kill:
@@ -709,7 +823,7 @@ def split_path_safe(cache, split_radius, split_landing):
 
     too_close_to_virus_path = (
         dists_to_path <
-        split_radius + virus_rads + split_radius * 0.8
+        split_radius + virus_rads + split_radius * SPLIT_VIRUS_BUFFER_MULT
     )
 
     return not bool(np.any(dangerous_viruses & too_close_to_virus_path))
@@ -848,7 +962,22 @@ def choose_direction(game: Game):
                     future_y,
                 )
 
+                position_score += movement_virus_score(
+                    cache,
+                    x,
+                    y,
+                    future_x,
+                    future_y,
+                )
+
                 if step == 1:
+                    position_score += own_blob_virus_score(
+                        cache,
+                        dx,
+                        dy,
+                        step_distance,
+                    )
+
                     position_score += enemy_split_threat_score(
                         cache,
                         future_x,
