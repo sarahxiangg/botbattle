@@ -92,6 +92,31 @@ def food_score(cache, future_x, future_y, weight):
 
     return float(np.sum(scores))
 
+def food_direction(cache, player):
+    food_locs = cache["food_locs"]
+
+    if len(food_locs) == 0:
+        return None
+
+    player_pos = np.array([player.x, player.y], dtype=float)
+
+    vectors = food_locs - player_pos
+    dists = np.linalg.norm(vectors, axis=1)
+    dists[dists < 1.0] = 1.0
+
+    weights = 1.0 / (dists ** 2)
+
+    target = np.sum(food_locs * weights.reshape(-1, 1), axis=0) / np.sum(weights)
+
+    direction = target - player_pos
+    norm = np.linalg.norm(direction)
+
+    if norm == 0:
+        return None
+
+    direction = direction / norm
+    return float(direction[0]), float(direction[1])
+
 
 def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, hunt_ratio, merged_safe_ratio):
     future_pos = np.array([future_x, future_y], dtype=float)
@@ -547,6 +572,20 @@ def choose_direction(game: Game) -> tuple[float, float]:
     cache = build_cache(game)
     weights = get_mode_weights(player)
 
+    #FOOD OVERRIDE
+    if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
+        food_dir = food_direction(cache, player)
+
+        if food_dir is not None:
+            dx, dy = food_dir
+            future_x = player.x + dx * step_distance
+            future_y = player.y + dy * step_distance
+
+            if wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2:
+                LAST_DIRECTION = np.array([dx, dy], dtype=float)
+                return dx, dy
+
+    #KILL OVERRIDE
     kill_dir = close_kill_direction(cache, player)
 
     if kill_dir is not None:
@@ -572,6 +611,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
         )
     ]
 
+    #MAIN BEAM SEARCH
     for step in range(1, ROLLOUT_STEPS + 1):
         new_beam = []
 
