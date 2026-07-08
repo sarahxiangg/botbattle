@@ -733,7 +733,6 @@ def override_direction(cache, player, step_distance):
         future_y = player.y + dy * step_distance
 
         if (
-            wall_score(player, future_x, future_y) != -OFF_MAP_PENALTY and
             enemy_split_threat_score(cache, player, future_x, future_y) > -20000 and
             virus_score(cache, player, future_x, future_y, VIRUS_DANGER_WEIGHT, VIRUS_SAFE_WEIGHT) > -OFF_MAP_PENALTY / 2
         ):
@@ -749,8 +748,7 @@ def override_direction(cache, player, step_distance):
             future_x = player.x + dx * step_distance
             future_y = player.y + dy * step_distance
 
-            if wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2:
-                return dx, dy
+            return dx, dy
 
     return None
 
