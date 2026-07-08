@@ -33,7 +33,7 @@ STEP_DISTANCE_MULT = 1.5
 ROLLOUT_STEPS = 1
 ROLLOUT_DISCOUNT = 0.7
 BEAM_WIDTH = 1
-TURN_PENALTY_WEIGHT = 80.0
+TURN_PENALTY_WEIGHT = 80.
 
 # Food farming
 FOOD_RUSH_MAX_RADIUS = 2.2
@@ -55,6 +55,9 @@ FOOD_CLUSTER_RADIUS = 4.0
 FOOD_CLUSTER_WEIGHT = 0.55
 FOOD_DISTANCE_POWER = 1.15
 FOOD_MIN_TARGET_DIST = 0.15
+
+EARLY_FOOD_MAX_RADIUS = 2.3
+LATE_GAME_RADIUS = 2.6
 
 # Danger override
 DANGER_OVERRIDE_RANGE_MULT = 9.0
@@ -86,14 +89,14 @@ VIRUS_FARM_PIECE_RADIUS_MULT = 0.45
 CHASE_RANGE_MULT = 5.0
 CLOSE_KILL_RANGE_MULT = 1.5
 
-SPLIT_MIN_RADIUS = 1.45
-SPLIT_EAT_RATIO = 1.15
-SPLIT_RANGE_MULT = 2.6
-SPLIT_RANGE_SAFETY_MULT = 0.75
-SPLIT_ALIGNMENT_MIN = 0.92
-SPLIT_TARGET_MIN_RADIUS_MULT = 0.28
-SPLIT_VIRUS_BUFFER_MULT = 1.4
-POST_SPLIT_DANGER_RANGE_MULT = 6.0
+SPLIT_MIN_RADIUS = 1.35
+SPLIT_EAT_RATIO = 1.10
+SPLIT_RANGE_MULT = 3.0
+SPLIT_RANGE_SAFETY_MULT = 0.88
+SPLIT_ALIGNMENT_MIN = 0.88
+SPLIT_TARGET_MIN_RADIUS_MULT = 0.16
+SPLIT_VIRUS_BUFFER_MULT = 1.3
+POST_SPLIT_DANGER_RANGE_MULT = 5.5
 
 # Stuck fallback
 WALL_BUFFER = 0.25
@@ -796,7 +799,7 @@ def split_path_safe(cache, split_radius, split_landing):
     return score > -OFF_MAP_PENALTY / 2
 
 
-def close_kill_override(cache, step_distance):
+def close_kill_override(cache, step_distance, split_only=False):
     if cache["own_blob_count"] != 1:
         return None
 
@@ -869,6 +872,9 @@ def close_kill_override(cache, step_distance):
                 continue
 
             return dx, dy, True
+    
+    if split_only:
+        return None
 
     # =========================
     # Chase instead of risky split
@@ -1100,36 +1106,58 @@ def unstuck_override(cache, step_distance):
 
 
 def override_direction(cache, step_distance):
-    # 1. Most important: avoid enemies at all costs.
+    player_radius = cache["player_radius"]
+
+    # 1. Avoid enemies at all costs.
     danger_dir = danger_avoidance_override(cache, step_distance)
 
     if danger_dir is not None:
         return danger_dir
 
-    # 2. If stuck, force a safe move away from walls/corners.
+    # 2. Unstuck if trapped.
     unstuck_dir = unstuck_override(cache, step_distance)
 
     if unstuck_dir is not None:
         return unstuck_dir
 
-    # 3. Virus farming.
+    # 3. Always take split kills before farming.
+    split_dir = close_kill_override(
+        cache,
+        step_distance,
+        split_only=True,
+    )
+
+    if split_dir is not None:
+        return split_dir
+
+    # 4. Farm virus as soon as physically possible and safe.
     virus_dir = virus_farming_override(cache, step_distance)
 
     if virus_dir is not None:
         return virus_dir
 
+    # 5. Early game: prioritise food farming.
+    if player_radius < EARLY_FOOD_MAX_RADIUS:
+        food_dir = food_farming_override(cache, step_distance)
 
-    # 4. Food farming.
+        if food_dir is not None:
+            return food_dir
+
+    # 6. Mid/late game: prioritise chasing/killing over food.
+    kill_dir = close_kill_override(
+        cache,
+        step_distance,
+        split_only=False,
+    )
+
+    if kill_dir is not None:
+        return kill_dir
+
+    # 7. Only farm food late game if literally nothing better exists.
     food_dir = food_farming_override(cache, step_distance)
 
     if food_dir is not None:
         return food_dir
-
-    # 5. Close kill / chase / split.
-    kill_dir = close_kill_override(cache, step_distance)
-
-    if kill_dir is not None:
-        return kill_dir
 
     return None
 
