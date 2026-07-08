@@ -31,8 +31,8 @@ DANGER_DISTANCE_POWER = 1.3
 
 # Anti-jitter
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
-SMOOTHING = 0.10
-STICKINESS_WEIGHT = 300.0
+SMOOTHING = 0.0 #0.10
+STICKINESS_WEIGHT = 0.0 #300.0
 TURN_PENALTY_WEIGHT = 150.0
 
 # Lookahead / performance
