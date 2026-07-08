@@ -10,17 +10,18 @@ NUM_DIRECTIONS = 16
 FOOD_WEIGHT = 1000.0
 ENEMY_DANGER_WEIGHT = 8000.0
 ENEMY_HUNT_WEIGHT = 2500.0
-VIRUS_DANGER_WEIGHT = 20000.0
+VIRUS_DANGER_WEIGHT = 10000.0
 VIRUS_SAFE_WEIGHT = 200.0
 
-SMOOTHING = 0.65
+SMOOTHING = 0.10
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
 STICKINESS_WEIGHT = 300.0
+SWITCH_THRESHOLD = 75.0
 
 
 
 '''
-    Vector functions: food_vector, enemy_vector
+    Vector functions: food_score, enemy_score
 '''
 
 def food_score(game, player, future_x, future_y, weight):
@@ -150,7 +151,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
         #smoothing
         score += STICKINESS_WEIGHT * np.dot(direction, LAST_DIRECTION)
 
-        if score > best_score:
+        if score > best_score + SWITCH_THRESHOLD:
             best_score = score
             best_direction = direction
         
