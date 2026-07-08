@@ -68,16 +68,24 @@ CLOSE_KILL_RANGE_MULT = 1.5
 
 SPLIT_MIN_RADIUS = 1.45
 SPLIT_EAT_RATIO = 1.15
-SPLIT_RANGE_MULT = 3.0
-SPLIT_ALIGNMENT_MIN = 0.88
+SPLIT_RANGE_MULT = 2.6
+SPLIT_RANGE_SAFETY_MULT = 0.75
+SPLIT_ALIGNMENT_MIN = 0.92
+SPLIT_TARGET_MIN_RADIUS_MULT = 0.28
 SPLIT_VIRUS_BUFFER_MULT = 1.4
 POST_SPLIT_DANGER_RANGE_MULT = 6.0
 
 # Stuck fallback
+WALL_BUFFER = 0.25
+WALL_PENALTY_WEIGHT = 300.0
+
+STUCK_TICK_LIMIT = 4
+STUCK_MOVE_EPS_MULT = 0.04
+STUCK_CENTER_WEIGHT = 600.0
+STUCK_MOVE_WEIGHT = 2000.0
+
 LAST_POSITION = None
 STUCK_TICKS = 0
-STUCK_TICK_LIMIT = 4
-STUCK_MOVE_EPS_MULT = 0.05
 
 
 # =========================
@@ -94,8 +102,15 @@ def normalize(vec):
 
 
 def clamp_point_for_radius(x, y, radius):
-    x = min(max(x, radius), ARENA_SIZE - radius)
-    y = min(max(y, radius), ARENA_SIZE - radius)
+    min_pos = radius + WALL_BUFFER
+    max_pos = ARENA_SIZE - radius - WALL_BUFFER
+
+    if min_pos > max_pos:
+        min_pos = radius
+        max_pos = ARENA_SIZE - radius
+
+    x = min(max(x, min_pos), max_pos)
+    y = min(max(y, min_pos), max_pos)
 
     return x, y
 
@@ -492,14 +507,32 @@ def nearest_food_direction(cache):
         return None
 
     player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
 
-    vectors = food_locs - player_pos
+    target_locs = []
+
+    for food_pos in food_locs:
+        tx, ty = clamp_point_for_radius(
+            food_pos[0],
+            food_pos[1],
+            player_radius,
+        )
+        target_locs.append([tx, ty])
+
+    target_locs = np.array(target_locs, dtype=float)
+
+    vectors = target_locs - player_pos
     dists = np.linalg.norm(vectors, axis=1)
 
-    if len(dists) == 0:
+    valid = dists > 0.15
+
+    if not np.any(valid):
         return None
 
-    idx = int(np.argmin(dists))
+    scores = np.full(len(dists), -1.0)
+    scores[valid] = 1.0 / dists[valid]
+
+    idx = int(np.argmax(scores))
 
     direction = normalize(vectors[idx])
 
@@ -600,6 +633,7 @@ def close_kill_override(cache, step_distance):
     safe_dists[safe_dists < 1.0] = 1.0
 
     dirs = vectors / safe_dists.reshape(-1, 1)
+
     edge_dists = dists - player_radius - blob_rads
 
     can_eat = player_radius > blob_rads * EAT_RATIO
@@ -607,18 +641,33 @@ def close_kill_override(cache, step_distance):
     if not np.any(can_eat):
         return None
 
+    # =========================
+    # Conservative split finisher
+    # =========================
+
     split_radius = player_radius / np.sqrt(2.0)
     split_range = player_radius * SPLIT_RANGE_MULT
+
+    useful_target = blob_rads > player_radius * SPLIT_TARGET_MIN_RADIUS_MULT
+
+    # Realistic hit reach:
+    # split piece travels split_range, and can collide using split_radius + target_radius.
+    hit_reach = split_range * SPLIT_RANGE_SAFETY_MULT + split_radius + blob_rads
 
     split_candidates = (
         (player_radius >= SPLIT_MIN_RADIUS) &
         (split_radius > blob_rads * SPLIT_EAT_RATIO) &
-        (edge_dists <= split_range) &
+        (dists <= hit_reach) &
+        useful_target &
         can_eat
     )
 
     if np.any(split_candidates) and post_split_enemy_safe(cache, split_radius):
-        scores = blob_rads.copy()
+        scores = (
+            blob_rads * 3.0
+            - dists * 0.25
+        )
+
         scores[~split_candidates] = -1.0
 
         candidate_indices = np.argsort(scores)[::-1]
@@ -639,6 +688,10 @@ def close_kill_override(cache, step_distance):
                 continue
 
             return dx, dy, True
+
+    # =========================
+    # Chase instead of risky split
+    # =========================
 
     chase_candidates = can_eat & (edge_dists < player_radius * CHASE_RANGE_MULT)
 
@@ -773,6 +826,98 @@ def virus_farming_override(cache, step_distance):
 # Override wrapper
 # =========================
 
+def is_stuck(cache):
+    global LAST_POSITION, STUCK_TICKS
+
+    pos = cache["player_pos"]
+    r = cache["player_radius"]
+
+    if LAST_POSITION is None:
+        LAST_POSITION = pos.copy()
+        return False
+
+    moved = np.linalg.norm(pos - LAST_POSITION)
+
+    if moved < r * STUCK_MOVE_EPS_MULT:
+        STUCK_TICKS += 1
+    else:
+        STUCK_TICKS = 0
+
+    LAST_POSITION = pos.copy()
+
+    return STUCK_TICKS >= STUCK_TICK_LIMIT
+
+
+def unstuck_override(cache, step_distance):
+    if not is_stuck(cache):
+        return None
+
+    best_score = -float("inf")
+    best_direction = None
+
+    player_pos = cache["player_pos"]
+    center = np.array([ARENA_SIZE / 2.0, ARENA_SIZE / 2.0], dtype=float)
+
+    center_vec = center - player_pos
+    center_dir = normalize(center_vec)
+
+    for direction in DIRECTIONS:
+        dx, dy = direction
+
+        if not move_safe_from_enemies(cache, dx, dy, step_distance):
+            continue
+
+        future_x = cache["player_x"] + dx * step_distance
+        future_y = cache["player_y"] + dy * step_distance
+        future_x, future_y = clamp_position(cache, future_x, future_y)
+
+        actual_move = np.linalg.norm(
+            np.array(
+                [
+                    future_x - cache["player_x"],
+                    future_y - cache["player_y"],
+                ],
+                dtype=float,
+            )
+        )
+
+        if actual_move < step_distance * 0.25:
+            continue
+
+        virus_score = movement_virus_score(
+            cache,
+            cache["player_x"],
+            cache["player_y"],
+            future_x,
+            future_y,
+        )
+
+        if virus_score <= -OFF_MAP_PENALTY / 2:
+            continue
+
+        own_virus_score = own_blob_virus_score(cache, dx, dy, step_distance)
+
+        if own_virus_score <= -OFF_MAP_PENALTY / 2:
+            continue
+
+        score = 0.0
+        score += STUCK_MOVE_WEIGHT * actual_move
+        score += wall_score(cache, future_x, future_y)
+        score += virus_score
+        score += own_virus_score
+
+        if center_dir is not None:
+            score += STUCK_CENTER_WEIGHT * np.dot(direction, center_dir)
+
+        if score > best_score:
+            best_score = score
+            best_direction = direction
+
+    if best_direction is None:
+        return None
+
+    return float(best_direction[0]), float(best_direction[1]), False
+
 def override_direction(cache, step_distance):
     # 1. Most important: avoid enemies at all costs.
     danger_dir = danger_avoidance_override(cache, step_distance)
@@ -780,19 +925,25 @@ def override_direction(cache, step_distance):
     if danger_dir is not None:
         return danger_dir
 
-    # 2. If smaller than useful virus-farming size, farm food efficiently.
+    # 2. If stuck, force a safe move away from walls/corners.
+    unstuck_dir = unstuck_override(cache, step_distance)
+
+    if unstuck_dir is not None:
+        return unstuck_dir
+
+    # 3. Food farming.
     food_dir = food_farming_override(cache, step_distance)
 
     if food_dir is not None:
         return food_dir
 
-    # 3. Close kill / chase / split.
+    # 4. Close kill / chase / split.
     kill_dir = close_kill_override(cache, step_distance)
 
     if kill_dir is not None:
         return kill_dir
 
-    # 4. Finally, virus farming.
+    # 5. Virus farming.
     virus_dir = virus_farming_override(cache, step_distance)
 
     if virus_dir is not None:
@@ -804,6 +955,23 @@ def override_direction(cache, step_distance):
 # =========================
 # Fallback scoring / beam
 # =========================
+
+def wall_score(cache, x, y):
+    r = cache["player_radius"]
+
+    nearest_wall = min(
+        x - r,
+        ARENA_SIZE - x - r,
+        y - r,
+        ARENA_SIZE - y - r,
+    )
+
+    if nearest_wall >= WALL_BUFFER:
+        return 0.0
+
+    closeness = (WALL_BUFFER - nearest_wall) / max(WALL_BUFFER, 1e-9)
+
+    return -WALL_PENALTY_WEIGHT * (closeness ** 2)
 
 def food_score(cache, x, y):
     food_locs = cache["food_locs"]
@@ -871,6 +1039,8 @@ def score_position(cache, x, y):
         cache["player_radius"],
         VIRUS_HARD_BUFFER_MULT,
     )
+
+    score += wall_score(cache, x, y)
 
     return score
 
