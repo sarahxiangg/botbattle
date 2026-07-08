@@ -119,10 +119,23 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     bigger = individually_dangerous | merged_dangerous
 
     # Hunt small blobs unless the enemy's total visible mass is way too large
-    smaller = (
+    EAT_RATIO = 1.12
+    CLOSE_KILL_RANGE_MULT = 2.2
+
+    can_eat = player_radius > blob_rads * EAT_RATIO
+
+    normal_hunt = (
+        can_eat &
         (blob_rads < player_radius * hunt_ratio) &
         (merged_rads < player_radius * merged_safe_ratio)
     )
+
+    close_kill = (
+        can_eat &
+        (edge_dists < player_radius * CLOSE_KILL_RANGE_MULT)
+    )
+
+    smaller = normal_hunt | close_kill
 
     danger_size = np.maximum(blob_rads, merged_rads)
 
@@ -134,6 +147,38 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     score += np.sum(hunt_scores[smaller])
 
     return float(score)
+
+def close_kill_direction(cache, player):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+
+    if len(blob_locs) == 0:
+        return None
+
+    player_pos = np.array([player.x, player.y], dtype=float)
+    player_radius = player.radius
+
+    vectors = blob_locs - player_pos
+    dists = np.linalg.norm(vectors, axis=1)
+    dists[dists < 1.0] = 1.0
+
+    edge_dists = dists - player_radius - blob_rads
+
+    can_eat = player_radius > blob_rads * 1.12
+    close = edge_dists < player_radius * 1.8
+
+    targets = can_eat & close
+
+    if not np.any(targets):
+        return None
+
+    scores = blob_rads / dists
+    scores[~targets] = -1.0
+
+    idx = int(np.argmax(scores))
+
+    direction = vectors[idx] / dists[idx]
+    return float(direction[0]), float(direction[1])
 
 def enemy_split_threat_score(cache, player, future_x, future_y):
     blob_locs = cache["blob_locs"]
@@ -485,6 +530,20 @@ def choose_direction(game: Game) -> tuple[float, float]:
     step_distance = STEP_DISTANCE_MULT * player.radius
     cache = build_cache(game)
     weights = get_mode_weights(player)
+
+    kill_dir = close_kill_direction(cache, player)
+
+    if kill_dir is not None:
+        dx, dy = kill_dir
+        future_x = player.x + dx * step_distance
+        future_y = player.y + dy * step_distance
+
+        if (
+            wall_score(player, future_x, future_y) > -10000 and
+            enemy_split_threat_score(cache, player, future_x, future_y) > -20000
+        ):
+            LAST_DIRECTION = np.array([dx, dy], dtype=float)
+            return dx, dy
 
     #(total_score, x, y, first_direction, previous_direction)
     beam = [
