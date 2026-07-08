@@ -538,18 +538,16 @@ def food_direction(cache):
 
     vectors = food_locs - player_pos
     dists = np.linalg.norm(vectors, axis=1)
-    dists[dists < 1.0] = 1.0
 
-    weights = 1.0 / (dists ** 2)
-    target = np.sum(food_locs * weights.reshape(-1, 1), axis=0) / np.sum(weights)
-
-    direction = target - player_pos
-    norm = np.linalg.norm(direction)
-
-    if norm == 0:
+    if len(dists) == 0:
         return None
 
-    direction = direction / norm
+    idx = int(np.argmin(dists))
+
+    if dists[idx] < 1.0:
+        return None
+
+    direction = vectors[idx] / dists[idx]
 
     return float(direction[0]), float(direction[1])
 
@@ -607,12 +605,39 @@ def dangerous_enemy_near(cache, range_mult):
 
     return bool(np.any(dangerous & too_close))
 
+def virus_farm_enemy_safe(cache):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
+
+    if len(blob_locs) == 0:
+        return True
+
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+
+    # After virus crash, assume our pieces are much smaller.
+    estimated_piece_radius = player_radius * 0.50
+
+    dists = np.linalg.norm(blob_locs - player_pos, axis=1)
+    edge_dists = dists - player_radius - blob_rads
+
+    danger_size = np.maximum(blob_rads, merged_rads)
+
+    can_eat_pieces = danger_size > estimated_piece_radius * 1.10
+    close_enough_to_punish = edge_dists < player_radius * 7.0
+
+    return not bool(np.any(can_eat_pieces & close_enough_to_punish))
+
 
 def virus_farm_direction(cache, step_distance):
     virus_locs = cache["virus_locs"]
     virus_rads = cache["virus_rads"]
 
     if len(virus_locs) == 0:
+        return None
+    
+    if not virus_farm_enemy_safe(cache):
         return None
 
     player_radius = cache["player_radius"]
