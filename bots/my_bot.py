@@ -13,10 +13,17 @@ ENEMY_HUNT_WEIGHT = 2500.0
 VIRUS_DANGER_WEIGHT = 10000.0
 VIRUS_SAFE_WEIGHT = 200.0
 
-SMOOTHING = 0.10
 LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
-STICKINESS_WEIGHT = 300.0
 SWITCH_THRESHOLD = 75.0
+
+SMOOTHING = 0.10
+STICKINESS_WEIGHT = 300.0
+
+ROLLOUT_STEPS = 3
+ROLLOUT_DISCOUNT = 0.7
+STEP_DISTANCE_MULT = 1.5
+BEAM_WIDTH = 6
+TURN_PENALTY_WEIGHT = 150.0
 
 
 
@@ -82,14 +89,13 @@ def virus_score(game, player, future_x, future_y, danger_weight, safety_weight):
     virus_rads = np.array([virus.radius for virus in viruses], dtype=float)
 
     player_radius = player.radius
-    player_mass = player_radius ** 2
 
     center_dists = np.linalg.norm(virus_locs - future_pos, axis=1)
 
     edge_dists = center_dists - player_radius - virus_rads
     edge_dists[edge_dists < 1.0] = 1.0
 
-    dangerous = player_mass > virus_rads * 1.2
+    dangerous = player_radius > virus_rads * 1.1
     safe = ~dangerous
 
     danger_scores = danger_weight / (edge_dists ** 4)
@@ -101,62 +107,119 @@ def virus_score(game, player, future_x, future_y, danger_weight, safety_weight):
 
     return float(score)
 
+def score_position(game, player, x, y):
+    score = 0.0
+
+    score += food_score(
+        game,
+        player,
+        x,
+        y,
+        weight=FOOD_WEIGHT
+    )
+
+    score += enemy_score(
+        game,
+        player,
+        x,
+        y,
+        danger_weight=ENEMY_DANGER_WEIGHT,
+        hunt_weight=ENEMY_HUNT_WEIGHT
+    )
+
+    score += virus_score(
+        game,
+        player,
+        x,
+        y,
+        danger_weight=VIRUS_DANGER_WEIGHT,
+        safety_weight=VIRUS_SAFE_WEIGHT
+    )
+
+    return score
+
 def choose_direction(game: Game) -> tuple[float, float]:
     global LAST_DIRECTION
 
     player = game.state.me
 
-    best_score = -float("inf")
-    best_direction = np.array([1.0, 0.0], dtype=float)
+    step_distance = STEP_DISTANCE_MULT * player.radius
 
-    lookahead_distance = 2 * player.radius
+    directions = []
 
     for i in range(NUM_DIRECTIONS):
         angle = 2 * np.pi * i / NUM_DIRECTIONS
-
         direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
-        dx, dy = direction
+        directions.append(direction)
 
-        future_x = player.x + dx * lookahead_distance
-        future_y = player.y + dy * lookahead_distance
-
-        score = 0.0
-
-        score += food_score(
-            game, 
-            player, 
-            future_x, 
-            future_y, 
-            weight=FOOD_WEIGHT
+    #(total_score, x, y, first_direction, previous_direction)
+    beam = [
+        (
+            0.0,
+            player.x,
+            player.y,
+            None,
+            LAST_DIRECTION,
         )
+    ]
 
-        score += enemy_score(
-            game, 
-            player, 
-            future_x, 
-            future_y, 
-            danger_weight=ENEMY_DANGER_WEIGHT, 
-            hunt_weight=ENEMY_HUNT_WEIGHT
-        )
+    for step in range(1, ROLLOUT_STEPS + 1):
+        new_beam = []
 
-        score += virus_score(
-            game, 
-            player, 
-            future_x, 
-            future_y, 
-            danger_weight=VIRUS_DANGER_WEIGHT,
-            safety_weight=VIRUS_SAFE_WEIGHT 
-        )
+        discount = ROLLOUT_DISCOUNT ** (step - 1)
 
-        #smoothing
-        score += STICKINESS_WEIGHT * np.dot(direction, LAST_DIRECTION)
+        for current_score, x, y, first_direction, previous_direction in beam:
+            for direction in directions:
+                dx, dy = direction
 
-        if score > best_score + SWITCH_THRESHOLD:
-            best_score = score
-            best_direction = direction
-        
+                future_x = x + dx * step_distance
+                future_y = y + dy * step_distance
+
+                position_score = score_position(
+                    game,
+                    player,
+                    future_x,
+                    future_y
+                )
+
+                total_score = current_score + discount * position_score
+
+                turn_alignment = np.dot(direction, previous_direction)
+                turn_penalty = TURN_PENALTY_WEIGHT * (1.0 - turn_alignment)
+                total_score -= turn_penalty
+
+                if step == 1:
+                    total_score += STICKINESS_WEIGHT * np.dot(direction, LAST_DIRECTION)
+
+                if first_direction is None:
+                    new_first_direction = direction
+                else:
+                    new_first_direction = first_direction
+
+                new_beam.append(
+                    (
+                        total_score,
+                        future_x,
+                        future_y,
+                        new_first_direction,
+                        direction,
+                    )
+                )
+
+        # Keep only the best candidates
+        new_beam.sort(key=lambda item: item[0], reverse=True)
+        beam = new_beam[:BEAM_WIDTH]
+
+    best_score, best_x, best_y, best_direction, _ = beam[0]
+
     final_direction = SMOOTHING * LAST_DIRECTION + (1 - SMOOTHING) * best_direction
-    final_direction = final_direction / np.linalg.norm(final_direction)
+
+    norm = np.linalg.norm(final_direction)
+
+    if norm == 0:
+        final_direction = best_direction
+    else:
+        final_direction = final_direction / norm
 
     LAST_DIRECTION = final_direction
 
