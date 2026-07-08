@@ -563,7 +563,7 @@ def override_direction(cache, step_distance):
         dx, dy = kill_dir
 
         future_x = cache["player_x"] + dx * step_distance
-        future_y = cache["player_y"] + dy * 
+        future_y = cache["player_y"] + dy * step_distance
         
         future_x, future_y = clamp_position(cache, future_x, future_y)
 
