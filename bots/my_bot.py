@@ -69,8 +69,8 @@ ENEMY_SPLIT_CONE_ALIGNMENT = 0.65
 # =========================
 
 ARENA_SIZE = 60.0                 # map is 0..60 in both x/y
-WALL_DANGER_WEIGHT = 12000.0      # avoid wall edges
-WALL_MARGIN_MULT = 2.2            # avoid within 4 radii
+WALL_DANGER_WEIGHT = 3000.0       # avoid wall edges
+WALL_MARGIN_MULT = 1.2            # avoid within 4 radii
 OFF_MAP_PENALTY = 1_000_000_000.0 # huge penalty if touching wall
 
 
@@ -315,7 +315,7 @@ def wall_score(player, x, y):
 
     closeness = (safe_margin - nearest_wall) / safe_margin
 
-    return -WALL_DANGER_WEIGHT * (closeness ** 2)
+    return -WALL_DANGER_WEIGHT * (closeness ** 3)
 
 def split_penalty(game, split_radius):
     player = game.state.me
@@ -338,7 +338,7 @@ def split_penalty(game, split_radius):
 
     return False
 
-def get_split_decision(game, move_direction):
+def get_split_decision(game, move_direction, cache):
     player = game.state.me
 
     if player.radius < SPLIT_MIN_RADIUS:
@@ -395,6 +395,20 @@ def get_split_decision(game, move_direction):
             edge_dist > split_range   
         ):
             continue
+
+        virus_locs = cache["virus_locs"]
+        virus_rads = cache["virus_rads"]
+
+        if len(virus_locs) > 0:
+            split_landing = player_pos + blob_uv * split_range
+
+            dists_to_viruses = np.linalg.norm(virus_locs - split_landing, axis=1)
+            edge_to_viruses = dists_to_viruses - split_radius - virus_rads
+
+            dangerous_viruses = split_radius > virus_rads * 1.1
+
+            if np.any(dangerous_viruses & (edge_to_viruses < split_radius * 0.4)):
+                continue
 
 
         #pick best split
@@ -617,7 +631,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
     if override_dir is not None:
         dx, dy = override_dir
         LAST_DIRECTION = np.array([dx, dy], dtype=float)
-        return dx, dy
+        return dx, dy, cache
 
     #(total_score, x, y, first_direction, previous_direction)
     beam = [
@@ -660,7 +674,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
                 total_score -= turn_penalty
 
                 if step == 1:
-                    if wall_score(player, future_x, future_y) > -1000:
+                    if wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2:
                         total_score += STICKINESS_WEIGHT * np.dot(direction, LAST_DIRECTION)
 
                 if first_direction is None:
@@ -695,7 +709,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
 
     LAST_DIRECTION = final_direction
 
-    return float(final_direction[0]), float(final_direction[1])
+    return float(final_direction[0]), float(final_direction[1]), cache
 
     
 def main() -> None:
@@ -707,9 +721,9 @@ def main() -> None:
         match query:
             case QueryMovePlayer():
                 try:
-                    dx, dy = choose_direction(game)
+                    dx, dy, cache = choose_direction(game)
 
-                    should_do_split, split_direction = get_split_decision(game, (dx, dy))
+                    should_do_split, split_direction = get_split_decision(game, (dx, dy), cache)
 
                     if should_do_split:
                         sx, sy = split_direction
