@@ -16,7 +16,7 @@ FOOD_CLUSTER_RADIUS_MULT = 2.0
 FOOD_VALUE_WEIGHT = 6.0
 PREY_VALUE_WEIGHT = 3.0
 THREAT_RADIUS_RATIO = 1.08
-PREY_RADIUS_RATIO = 0.82
+PREY_RADIUS_RATIO = 0.83       # ≈ 1/EAT_SIZE_RATIO = 1/1.2 = 0.833; hunt any blob we can eat
 EAT_SIZE_RATIO = 1.2
 MAX_BLOB_COUNT = 16
 SPLIT_MIN_MASS = 2.0
@@ -24,12 +24,12 @@ SPLIT_EJECT_SPEED = 1.6
 SPLIT_TARGET_VALUE = 240.0
 SPLIT_REACH_EXTRA_TICKS = 3.0
 SPLIT_DANGER_LOOKAHEAD = 2.5
-SAFETY_MARGIN = 18.0
-SPLIT_THREAT_RATIO = 1.65
-SPLIT_REACH_MULT = 4.0
+SAFETY_MARGIN = 2.0            # buffer above eater.radius – was 18.0 which is 30% of the 60×60 arena
+SPLIT_THREAT_RATIO = 1.75      # child after split needs to eat us: 1.2*√2 ≈ 1.697; use 1.75 for margin
+SPLIT_EXTRA_REACH = 7.0        # extra cone reach for split threats (≈4 units eject + 3 units directional in 3 ticks)
 VIRUS_DANGER_RATIO = 0.75
 SURVIVAL_HEADING_STICKINESS = 1.5
-FARM_HEADING_STICKINESS = 25.0
+FARM_HEADING_STICKINESS = 12.0  # was 25.0 – more responsive in tight 60×60 arena
 VIRUS_ROUTE_TARGET_WEIGHT = 4.0
 VIRUS_ROUTE_HEADING_STICKINESS = 2.5
 SURVIVAL_SMOOTHING = 0.35
@@ -39,6 +39,18 @@ FARMING_SMOOTHING = 0.65
 EARLY_GAME_THRESHOLD = 0.25   # first 25% of rounds counts as early game
 EARLY_THREAT_RATIO = 1.3      # lower = fewer angles blocked → more aggressive movement
 EARLY_FARM_STICKINESS = 8.0   # lower = faster pivots to chase food/prey
+
+# Arena edge avoidance (arena is 60×60; coordinates go from 0 to ARENA_SIZE)
+EDGE_AVOID_MARGIN = 6.0       # wall danger activates within this distance of player center
+EDGE_BLOCK_RADIUS = 3.5       # virtual radius for wall danger-cone calculation
+
+# Merge drive: converge split blobs once merge cooldown expires
+MERGE_PULL_WEIGHT = 85.0      # goal score weight for blob convergence direction
+MERGE_READY_COOLDOWN = 3      # merge_cooldown threshold to count a blob as merge-ready
+
+# Prey hunting urgency scales with size (mass decay = 0.002/tick; large blobs bleed mass)
+LARGE_RADIUS_THRESHOLD = 3.0  # radius above which prey-score bonus activates
+LARGE_PREY_BONUS = 2.0        # max prey-score multiplier when at or above threshold
 
 _LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
 
@@ -57,6 +69,7 @@ class _Ctx:
         "visible_viruses",
         "food_clusters",
         "round_frac",
+        "arena_size",
     )
 
     def __init__(
@@ -71,6 +84,7 @@ class _Ctx:
         visible_viruses: list,
         food_clusters: list,
         round_frac: float,
+        arena_size: float,
     ) -> None:
         self.player_id = player_id
         self.player_pos = player_pos
@@ -82,6 +96,7 @@ class _Ctx:
         self.visible_viruses = visible_viruses
         self.food_clusters = food_clusters
         self.round_frac = round_frac
+        self.arena_size = arena_size
 
 
 def _pos(obj) -> np.ndarray:
@@ -342,7 +357,7 @@ def _split_would_hit_bad_virus(
         virus_radius = _radius(virus)
         if _segment_distance(virus_pos, start, end) > child_radius + virus_radius:
             continue
-        if child_radius * child_radius > virus_radius * EAT_SIZE_RATIO:
+        if child_radius * child_radius > virus_radius * virus_radius * EAT_SIZE_RATIO:
             return True
 
     return False
@@ -450,9 +465,11 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
             continue
 
         can_split_threat = blob_radius >= ctx.player_radius * SPLIT_THREAT_RATIO
-        reach = blob_radius + ctx.player_radius + SAFETY_MARGIN
+        # Eating condition: target center must be inside eater circle (dist ≤ eater.radius).
+        # Reach is eater.radius + safety buffer. Player radius is NOT added here.
+        reach = blob_radius + SAFETY_MARGIN
         if can_split_threat:
-            reach += ctx.player_radius * SPLIT_REACH_MULT
+            reach += SPLIT_EXTRA_REACH
 
         detection_distance = reach + ctx.player_radius * 4.0
         if edge_distance <= detection_distance:
@@ -467,7 +484,8 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
         virus_radius = _radius(virus)
         edge_distance = _edge_distance(ctx.player_pos, ctx.player_radius, virus_pos, virus_radius)
 
-        dangerous = ctx.player_radius * ctx.player_radius > virus_radius * EAT_SIZE_RATIO
+        # Engine: blob.mass > virus_radius² * EAT_SIZE_RATIO  (was missing the square)
+        dangerous = ctx.player_radius * ctx.player_radius > virus_radius * virus_radius * EAT_SIZE_RATIO
         close_enough_to_clip = edge_distance <= ctx.player_radius * 2.0
         close_enough_to_matter = edge_distance <= virus_radius + ctx.player_radius * 3.0
         if dangerous and (close_enough_to_clip or close_enough_to_matter):
@@ -475,6 +493,26 @@ def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarr
             interval = _danger_cone(ctx.player_pos, virus_pos, reach)
             if interval is not None:
                 blocked.append(interval)
+
+    # Wall avoidance: treat arena boundaries as virtual obstacles.
+    # Engine clamps blobs to [radius, arena_size - radius], so walls are at 0 and arena_size.
+    if ctx.arena_size > 0:
+        px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
+        for wall_pt in (
+            np.array([0.0, py]),
+            np.array([ctx.arena_size, py]),
+            np.array([px, 0.0]),
+            np.array([px, ctx.arena_size]),
+        ):
+            dist = _norm(wall_pt - ctx.player_pos)
+            if 0 < dist < EDGE_AVOID_MARGIN:
+                interval = _danger_cone(ctx.player_pos, wall_pt, EDGE_BLOCK_RADIUS)
+                if interval is not None:
+                    blocked.append(interval)
+                # Push emergency escape vectors away from wall
+                emergency_away.append(
+                    _unit(ctx.player_pos - wall_pt) * (EDGE_AVOID_MARGIN / max(1.0, dist))
+                )
 
     return blocked, emergency_away, has_threat
 
@@ -527,6 +565,11 @@ def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
     best_score = -float("inf")
     # Early game: lower stickiness → faster pivots to chase food/prey
     farm_stickiness = FARM_HEADING_STICKINESS if ctx.round_frac > EARLY_GAME_THRESHOLD else EARLY_FARM_STICKINESS
+    # Large blobs decay at 0.2%/tick: proportionally boost prey attraction to compensate
+    prey_mult = (
+        min(LARGE_PREY_BONUS, LARGE_PREY_BONUS * ctx.player_radius / LARGE_RADIUS_THRESHOLD)
+        if ctx.player_radius > LARGE_RADIUS_THRESHOLD else 1.0
+    )
 
     for cluster in ctx.food_clusters:
         to_cluster = cluster["pos"] - ctx.player_pos
@@ -549,10 +592,30 @@ def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
             distance = max(1.0, _edge_distance(ctx.player_pos, ctx.player_radius, blob_pos, blob_radius))
             angle = _angle_of(to_blob)
             heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
-            score = (ctx.player_radius / max(1.0, blob_radius)) * PREY_VALUE_WEIGHT * 100.0 - distance + heading_stickiness
+            score = (ctx.player_radius / max(1.0, blob_radius)) * PREY_VALUE_WEIGHT * prey_mult * 100.0 - distance + heading_stickiness
             if score > best_score:
                 best_score = score
                 best_angle = angle
+
+    # Merge drive: when ≥2 blobs have expired cooldown, aim toward their mass-weighted centroid
+    # to collapse the vulnerable split window as quickly as possible.
+    if len(ctx.my_blobs) > 1:
+        ready = [b for b in ctx.my_blobs if int(getattr(b, "merge_cooldown", 999)) <= MERGE_READY_COOLDOWN]
+        if len(ready) >= 2:
+            total_m = sum(_radius(b) ** 2 for b in ctx.my_blobs)
+            if total_m > 0:
+                cx = sum(_blob_pos(b)[0] * _radius(b) ** 2 for b in ctx.my_blobs) / total_m
+                cy = sum(_blob_pos(b)[1] * _radius(b) ** 2 for b in ctx.my_blobs) / total_m
+                centroid = np.array([cx, cy])
+                to_centroid = centroid - ctx.player_pos
+                dist_centroid = _norm(to_centroid)
+                if dist_centroid > ctx.player_radius * 0.5:
+                    angle = _angle_of(to_centroid)
+                    heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
+                    score = MERGE_PULL_WEIGHT + heading_stickiness
+                    if score > best_score:
+                        best_score = score
+                        best_angle = angle
 
     return best_angle, best_score != -float("inf")
 
@@ -599,6 +662,7 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
     cur_round = int(getattr(game.state, "round", 0) or 0)
     max_rounds = int(getattr(game.state, "max_rounds", 1) or 1)
     round_frac = cur_round / max(1, max_rounds)
+    arena_size = float(getattr(game.state.map, "size", 0) or 0)
 
     visible_blobs = list(game.state.visible_blobs or [])
     visible_food = list(game.state.visible_food or [])
@@ -617,6 +681,7 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
         visible_viruses=visible_viruses,
         food_clusters=_build_food_clusters(visible_food, player_radius),
         round_frac=round_frac,
+        arena_size=arena_size,
     )
 
     blocked, emergency_away, has_threat = _blocked_angles(ctx)
