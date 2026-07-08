@@ -79,8 +79,7 @@ CLOSE_OVERRIDE_RANGE_MULT = 1.8
 
 
 '''
-    Vector functions: food_score, enemy_score, virus_score, wall score
-    Split functions: get_split_decision -> (yes/no, direction), split_penalty (if too dangerous)
+    Score functions: food_score, enemy_score, virus_score, wall score, multi-blob-safety score
 '''
 
 def food_score(cache, future_x, future_y, weight):
@@ -194,7 +193,7 @@ def close_kill_direction(cache, player):
     edge_dists = dists - player_radius - blob_rads
 
     can_eat = player_radius > blob_rads * 1.12
-    close = edge_dists < player_radius * 1.8
+    close = edge_dists < player_radius * 2.6
 
     targets = can_eat & close
 
@@ -318,6 +317,65 @@ def wall_score(player, x, y):
 
     return -WALL_DANGER_WEIGHT * (closeness ** 3)
 
+def multi_blob_safety_score(cache, player, future_x, future_y):
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+
+    if len(own_locs) <= 1:
+        return 0.0
+
+    current_pos = np.array([player.x, player.y], dtype=float)
+    future_pos = np.array([future_x, future_y], dtype=float)
+
+    # approximate all own blobs moving by the same chosen direction
+    delta = future_pos - current_pos
+    future_own_locs = own_locs + delta
+
+    score = 0.0
+
+    # virus safety for each own blob
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if len(virus_locs) > 0:
+        diffs = future_own_locs[:, None, :] - virus_locs[None, :, :]
+        dists = np.linalg.norm(diffs, axis=2)
+
+        edge_dists = dists - own_rads[:, None] - virus_rads[None, :]
+        dangerous = own_rads[:, None] > virus_rads[None, :] * 1.1
+
+        if np.any(dangerous & (edge_dists < own_rads[:, None] * 0.6)):
+            return -OFF_MAP_PENALTY
+
+        edge_dists[edge_dists < 1.0] = 1.0
+        score -= float(np.sum(VIRUS_DANGER_WEIGHT / (edge_dists[dangerous] ** 3)))
+
+    # enemy safety for each own blob
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+
+    if len(blob_locs) > 0:
+        diffs = future_own_locs[:, None, :] - blob_locs[None, :, :]
+        dists = np.linalg.norm(diffs, axis=2)
+
+        edge_dists = dists - own_rads[:, None] - blob_rads[None, :]
+        edge_dists[edge_dists < 1.0] = 1.0
+
+        dangerous = blob_rads[None, :] > own_rads[:, None] * 1.1
+
+        score -= float(np.sum(
+            ENEMY_DANGER_WEIGHT *
+            (blob_rads[None, :] / own_rads[:, None]) /
+            (edge_dists ** 2) *
+            dangerous
+        ))
+
+    return score
+
+'''
+Split functions: get_split_decision -> (yes/no, direction), split_penalty (if too dangerous)
+'''
+
 def split_penalty(cache, player, split_radius):
     blob_locs = cache["blob_locs"]
     blob_rads = cache["blob_rads"]
@@ -409,7 +467,6 @@ def get_split_decision(game, move_direction, cache):
             if np.any(dangerous_viruses & (edge_to_viruses < split_radius * 0.4)):
                 continue
 
-
         #pick best split
         if blob.radius > best_target_size:
             best_target_size = blob.radius
@@ -457,9 +514,26 @@ def score_position(player, cache, weights, x, y):
         y
     )
 
+    score += multi_blob_safety_score(
+        cache, 
+        player, 
+        x, 
+        y
+    )
+
     return score 
 
 def build_cache(game):
+    # --- OWN BLOBS ---
+    own_blobs = game.state.me.blobs
+
+    if own_blobs:
+        own_locs = np.array([blob.pos for blob in own_blobs], dtype=float)
+        own_rads = np.array([blob.radius for blob in own_blobs], dtype=float)
+    else:
+        own_locs = np.array([[game.state.me.x, game.state.me.y]], dtype=float)
+        own_rads = np.array([game.state.me.radius], dtype=float)
+
     # --- FOOD ---
     foods = game.state.visible_food
 
@@ -538,7 +612,9 @@ def build_cache(game):
         "merged_rads": merged_rads,
         "virus_locs": virus_locs,
         "virus_rads": virus_rads,
-        "potential_rads": potential_rads
+        "potential_rads": potential_rads,
+        "own_locs": own_locs,
+        "own_rads": own_rads
     }
 
 def get_mode_weights(player):
@@ -657,7 +733,7 @@ def override_direction(cache, player, step_distance):
         future_y = player.y + dy * step_distance
 
         if (
-            wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2 and
+            wall_score(player, future_x, future_y) != -OFF_MAP_PENALTY and
             enemy_split_threat_score(cache, player, future_x, future_y) > -20000 and
             virus_score(cache, player, future_x, future_y, VIRUS_DANGER_WEIGHT, VIRUS_SAFE_WEIGHT) > -OFF_MAP_PENALTY / 2
         ):
