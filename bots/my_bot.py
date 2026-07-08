@@ -5,35 +5,51 @@ from lib.models.penguin_model import DirectionModel
 
 import numpy as np
 
-NUM_DIRECTIONS = 16
+# =========================
+# Direction search
+# =========================
 
-FOOD_WEIGHT = 1000.0
-ENEMY_DANGER_WEIGHT = 8000.0
-ENEMY_HUNT_WEIGHT = 2500.0
-VIRUS_DANGER_WEIGHT = 10000.0
-VIRUS_SAFE_WEIGHT = 200.0
+NUM_DIRECTIONS = 16              # directions tested in search
 
-LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
-SWITCH_THRESHOLD = 75.0
+# =========================
+# Scoring weights
+# =========================
 
-SMOOTHING = 0.10
-STICKINESS_WEIGHT = 300.0
+FOOD_WEIGHT = 1000.0             # food attraction
+ENEMY_DANGER_WEIGHT = 8000.0     # avoid bigger enemies
+ENEMY_HUNT_WEIGHT = 2500.0       # chase smaller enemies
+VIRUS_DANGER_WEIGHT = 10000.0    # avoid dangerous viruses
+VIRUS_SAFE_WEIGHT = 200.0        # slight reward for safe viruses
 
-ROLLOUT_STEPS = 3
-ROLLOUT_DISCOUNT = 0.7
-STEP_DISTANCE_MULT = 1.5
-BEAM_WIDTH = 6
-TURN_PENALTY_WEIGHT = 150.0
 
-SPLIT_EAT_RATIO = 1.20
-SPLIT_RANGE_MULT = 4.0
-SPLIT_ALIGNMENT_MIN = 0.85
+# =========================
+# Anti-jitter
+# =========================
 
-POST_SPLIT_DANGER_RANGE_MULT = 6.0
-SPLIT_KILL_VALUE = 500.0
-SPLIT_DANGER_WEIGHT = 5000.0
-MIN_SPLIT_SCORE = 10000.04
+LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)  # previous direction
+SMOOTHING = 0.10                                    # old/new direction blend
+STICKINESS_WEIGHT = 300.0                           # reward same direction
 
+
+# =========================
+# Lookahead
+# =========================
+
+ROLLOUT_STEPS = 3                 # future steps checked
+ROLLOUT_DISCOUNT = 0.7            # future score discount
+STEP_DISTANCE_MULT = 1.5          # step size multiplier
+BEAM_WIDTH = 6                    # paths kept per step
+TURN_PENALTY_WEIGHT = 150.0       # discourage sharp turns
+
+
+# =========================
+# Splitting
+# =========================
+
+SPLIT_EAT_RATIO = 1.20              # required size advantage
+SPLIT_RANGE_MULT = 4.0              # split reach estimate
+SPLIT_ALIGNMENT_MIN = 0.85          # must face target
+POST_SPLIT_DANGER_RANGE_MULT = 6.0  # danger scan range
 
 '''
     Vector functions: food_score, enemy_score
@@ -85,58 +101,38 @@ def enemy_score(game, player, future_x, future_y, danger_weight, hunt_weight):
 
     return float(score)
 
-def post_split_danger_penalty(game, player, split_radius, player_pos):
-    blobs = game.state.visible_blobs
-
-    if not blobs:
-        return 0.0
-
-    blob_locs = np.array([blob.pos for blob in blobs], dtype=float)
-    blob_rads = np.array([blob.radius for blob in blobs], dtype=float)
-
-    # enemies that can eat our split piece
-    dangerous = blob_rads > split_radius * 1.15
-
-    if not np.any(dangerous):
-        return 0.0
-
-    danger_locs = blob_locs[dangerous]
-    danger_rads = blob_rads[dangerous]
-
-    center_dists = np.linalg.norm(danger_locs - player_pos, axis=1)
-
-    edge_dists = center_dists - split_radius - danger_rads
-    edge_dists[edge_dists < 1.0] = 1.0
+def split_would_be_dangerous(game, split_radius):
+    player = game.state.me
+    player_pos = np.array([player.x, player.y], dtype=float)
 
     danger_range = player.radius * POST_SPLIT_DANGER_RANGE_MULT
-    close_danger = edge_dists < danger_range
 
-    if not np.any(close_danger):
-        return 0.0
+    for blob in game.state.visible_blobs:
+        blob_pos = np.array(blob.pos, dtype=float)
 
-    close_rads = danger_rads[close_danger]
-    close_edge_dists = edge_dists[close_danger]
+        # Can this enemy eat our split piece?
+        if blob.radius <= split_radius * SPLIT_EAT_RATIO:
+            continue
 
-    danger_scores = (
-        SPLIT_DANGER_WEIGHT
-        * (close_rads / split_radius)
-        / (close_edge_dists ** 2)
-    )
+        dist = np.linalg.norm(blob_pos - player_pos)
+        edge_dist = dist - split_radius - blob.radius
 
-    return float(np.sum(danger_scores))
+        if edge_dist < danger_range:
+            return True
+
+    return False
 
 def get_split_decision(game, move_direction):
-    """
-    Returns:
-        (False, None) if we should not split.
-        (True, split_direction) if we should split.
-
-    split_direction is aimed directly at the best edible target.
-    """
     player = game.state.me
+
+    #only split if we are a single blob
+    if len(player.blobs) != 1: 
+        return False, None
+
     blobs = game.state.visible_blobs
 
-    if not blobs:
+    #if there are no visible blobs
+    if not blobs: 
         return False, None
 
     player_pos = np.array([player.x, player.y], dtype=float)
@@ -144,68 +140,53 @@ def get_split_decision(game, move_direction):
     move_direction = np.array(move_direction, dtype=float)
     move_norm = np.linalg.norm(move_direction)
 
-    if move_norm == 0:
+    if np.isclose(move_norm, 0.0):
         return False, None
 
     move_direction = move_direction / move_norm
 
-    blob_locs = np.array([blob.pos for blob in blobs], dtype=float)
-    blob_rads = np.array([blob.radius for blob in blobs], dtype=float)
-
     split_radius = player.radius / np.sqrt(2)
     split_range = player.radius * SPLIT_RANGE_MULT
 
-    # vectors from us to every visible blob
-    to_blobs = blob_locs - player_pos
-    center_dists = np.linalg.norm(to_blobs, axis=1)
-
-    valid_dist = center_dists > 0
-
-    safe_center_dists = center_dists.copy()
-    safe_center_dists[safe_center_dists == 0] = 1.0
-
-    to_blob_units = to_blobs / safe_center_dists.reshape(-1, 1)
-
-    edge_dists = center_dists - player.radius - blob_rads
-
-    # how much the target is in the same direction we are already moving
-    alignments = to_blob_units @ move_direction
-
-    in_front = alignments >= SPLIT_ALIGNMENT_MIN
-
-    # split piece must still be clearly bigger than target
-    can_eat = split_radius > blob_rads * SPLIT_EAT_RATIO
-
-    # target must be within estimated split launch range
-    in_range = edge_dists <= split_range
-
-    eligible = valid_dist & in_front & can_eat & in_range
-
-    if not np.any(eligible):
+    #do not split if splitting makes us vulnerable
+    if split_would_be_dangerous(game, split_radius):
         return False, None
 
-    danger_penalty = post_split_danger_penalty(
-        game,
-        player,
-        split_radius,
-        player_pos
-    )
+    best_target = None
+    best_target_size = -1
 
-    target_values = (blob_rads ** 2) * SPLIT_KILL_VALUE
-    split_scores = target_values - danger_penalty
+    #for each blob evaluate if its worth it to split
+    for blob in blobs:
+        blob_pos = np.array(blob.pos, dtype=float)
+        blob_vector = blob_pos - player_pos
+        dist = np.linalg.norm(blob_vector)
 
-    # ignore non-eligible targets
-    split_scores[~eligible] = -float("inf")
+        if np.isclose(dist, 0.0):
+            continue
 
-    best_idx = int(np.argmax(split_scores))
-    best_score = split_scores[best_idx]
+        blob_uv = blob_vector / dist
+        edge_dist = dist - player.radius - blob.radius
 
-    if best_score <= MIN_SPLIT_SCORE:
-        return False, None
+        alignment = np.dot(move_direction, blob_uv)
 
-    best_split_direction = to_blob_units[best_idx]
+        #pass of any of these conditions
+        if (
+            alignment < SPLIT_ALIGNMENT_MIN or
+            split_radius <= blob.radius * SPLIT_EAT_RATIO or
+            edge_dist > split_range   
+        ):
+            continue
 
-    return True, best_split_direction
+
+        #pick best split
+        if blob.radius > best_target_size:
+            best_target_size = blob.radius
+            best_target = blob_uv
+
+    if best_target is None:
+            return False, None
+
+    return True, best_target
 
 
 def virus_score(game, player, future_x, future_y, danger_weight, safety_weight):
@@ -229,7 +210,7 @@ def virus_score(game, player, future_x, future_y, danger_weight, safety_weight):
     dangerous = player_radius > virus_rads * 1.1
     safe = ~dangerous
 
-    danger_scores = danger_weight / (edge_dists ** 4)
+    danger_scores = danger_weight / (edge_dists ** 3)
     safety_scores = safety_weight / (edge_dists ** 2)
 
     score = 0.0
@@ -381,6 +362,7 @@ def main() -> None:
                             split=True,
                         )
                     )
+
                 else:
                     game.send_move(
                         MovePlayer(
