@@ -191,6 +191,9 @@ def split_penalty(game, split_radius):
 def get_split_decision(game, move_direction):
     player = game.state.me
 
+    if player.radius < 1.4:
+        return False, None
+
     #only split if we are a single blob
     if len(player.blobs) != 1: 
         return False, None
