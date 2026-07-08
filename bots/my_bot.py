@@ -5,11 +5,15 @@ from lib.models.penguin_model import DirectionModel
 
 import numpy as np
 
+import sys 
+import inspect
+
+print("MovePlayer signature:", inspect.signature(MovePlayer), file=sys.stderr, flush=True)
 # =========================
 # Direction search
 # =========================
 
-NUM_DIRECTIONS = 16              # directions tested in search
+NUM_DIRECTIONS = 12              # directions tested in search
 
 # =========================
 # Scoring weights
@@ -35,10 +39,10 @@ STICKINESS_WEIGHT = 300.0                           # reward same direction
 # Lookahead
 # =========================
 
-ROLLOUT_STEPS = 3                 # future steps checked
+ROLLOUT_STEPS = 2                 # future steps checked
 ROLLOUT_DISCOUNT = 0.7            # future score discount
 STEP_DISTANCE_MULT = 1.5          # step size multiplier
-BEAM_WIDTH = 6                    # paths kept per step
+BEAM_WIDTH = 4                    # paths kept per step
 TURN_PENALTY_WEIGHT = 150.0       # discourage sharp turns
 
 
@@ -50,6 +54,16 @@ SPLIT_EAT_RATIO = 1.20              # required size advantage
 SPLIT_RANGE_MULT = 4.0              # split reach estimate
 SPLIT_ALIGNMENT_MIN = 0.85          # must face target
 POST_SPLIT_DANGER_RANGE_MULT = 6.0  # danger scan range
+
+# =========================
+# Walls
+# =========================
+
+ARENA_SIZE = 60.0                 # map is 0..60 in both x/y
+WALL_DANGER_WEIGHT = 50000.0      # avoid wall edges
+WALL_MARGIN_MULT = 4.0            # avoid within 4 radii
+OFF_MAP_PENALTY = 1_000_000_000.0 # huge penalty if touching wall
+
 
 '''
     Vector functions: food_score, enemy_score
@@ -101,7 +115,7 @@ def enemy_score(game, player, future_x, future_y, danger_weight, hunt_weight):
 
     return float(score)
 
-def split_would_be_dangerous(game, split_radius):
+def split_penalty(game, split_radius):
     player = game.state.me
     player_pos = np.array([player.x, player.y], dtype=float)
 
@@ -149,7 +163,7 @@ def get_split_decision(game, move_direction):
     split_range = player.radius * SPLIT_RANGE_MULT
 
     #do not split if splitting makes us vulnerable
-    if split_would_be_dangerous(game, split_radius):
+    if split_penalty(game, split_radius):
         return False, None
 
     best_target = None
@@ -219,6 +233,28 @@ def virus_score(game, player, future_x, future_y, danger_weight, safety_weight):
 
     return float(score)
 
+def wall_score(player, x, y):
+    # distance from blob edge to each wall
+    left = x - player.radius
+    right = ARENA_SIZE - x - player.radius
+    bottom = y - player.radius
+    top = ARENA_SIZE - y - player.radius
+
+    nearest_wall = min(left, right, bottom, top)
+
+    # if our blob would touch/go outside the wall
+    if nearest_wall <= 0:
+        return -OFF_MAP_PENALTY
+
+    safe_margin = WALL_MARGIN_MULT * player.radius
+
+    # far from wall = no penalty
+    if nearest_wall >= safe_margin:
+        return 0.0
+
+    # closer wall = stronger penalty
+    return -WALL_DANGER_WEIGHT / (nearest_wall ** 2)
+
 def score_position(game, player, x, y):
     score = 0.0
 
@@ -246,6 +282,12 @@ def score_position(game, player, x, y):
         y,
         danger_weight=VIRUS_DANGER_WEIGHT,
         safety_weight=VIRUS_SAFE_WEIGHT
+    )
+
+    score += wall_score(
+        player, 
+        x, 
+        y
     )
 
     return score
@@ -301,7 +343,8 @@ def choose_direction(game: Game) -> tuple[float, float]:
                 total_score -= turn_penalty
 
                 if step == 1:
-                    total_score += STICKINESS_WEIGHT * np.dot(direction, LAST_DIRECTION)
+                    if wall_score(player, future_x, future_y) > -1000:
+                        total_score += STICKINESS_WEIGHT * np.dot(direction, LAST_DIRECTION)
 
                 if first_direction is None:
                     new_first_direction = direction
