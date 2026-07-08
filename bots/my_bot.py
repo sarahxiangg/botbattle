@@ -21,9 +21,7 @@ DIRECTIONS = np.array([
 # Scoring weights
 # =========================
 
-FOOD_WEIGHT = 1000.0             # food attraction
 ENEMY_DANGER_WEIGHT = 8000.0     # avoid bigger enemies
-ENEMY_HUNT_WEIGHT = 2500.0       # chase smaller enemies
 VIRUS_DANGER_WEIGHT = 10000.0    # avoid dangerous viruses
 VIRUS_SAFE_WEIGHT = 200.0        # slight reward for safe viruses
 
@@ -87,7 +85,7 @@ def food_score(cache, future_x, future_y, weight):
     return float(np.sum(scores))
 
 
-def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight):
+def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, hunt_ratio, merged_safe_ratio):
     future_pos = np.array([future_x, future_y], dtype=float)
 
     blob_locs = cache["blob_locs"]
@@ -105,7 +103,7 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight):
     edge_dists[edge_dists < 1.0] = 1.0
 
     bigger = (blob_rads > player_radius * 1.1) | (merged_rads > player_radius * 1.1)
-    smaller = (blob_rads < player_radius * 0.65) & (merged_rads < player_radius * 0.9)
+    smaller = (blob_rads < player_radius * hunt_ratio) & (merged_rads < player_radius * merged_safe_ratio)
 
     danger_size = np.maximum(blob_rads, merged_rads)
 
@@ -257,14 +255,14 @@ def get_split_decision(game, move_direction):
     return True, best_target
 
 
-def score_position(game, player, cache, x, y):
+def score_position(player, cache, weights, x, y):
     score = 0.0
 
     score += food_score(
         cache,
         x,
         y,
-        weight=FOOD_WEIGHT
+        weight=weights["food"]
     )
 
     score += enemy_score(
@@ -272,8 +270,10 @@ def score_position(game, player, cache, x, y):
         player,
         x,
         y,
-        danger_weight=ENEMY_DANGER_WEIGHT,
-        hunt_weight=ENEMY_HUNT_WEIGHT
+        danger_weight=weights["enemy_danger"],
+        hunt_weight=weights["enemy_hunt"],
+        hunt_ratio=weights["hunt_ratio"],
+        merged_safe_ratio=weights["merged_safe_ratio"]
     )
 
     score += virus_score(
@@ -351,6 +351,38 @@ def build_cache(game):
         "virus_rads": virus_rads,
     }
 
+def get_mode_weights(player):
+    r = player.radius
+
+    # Small: need growth, take more food, opportunistic hunts
+    if r < 1.5:
+        return {
+            "food": 1400.0,
+            "enemy_danger": 6000.0,
+            "enemy_hunt": 3200.0,
+            "hunt_ratio": 0.85,
+            "merged_safe_ratio": 1.05,
+        }
+
+    # Medium: balanced
+    if r < 2.5:
+        return {
+            "food": 1000.0,
+            "enemy_danger": 8000.0,
+            "enemy_hunt": 2200.0,
+            "hunt_ratio": 0.70,
+            "merged_safe_ratio": 0.95,
+        }
+
+    # Big: survival, avoid throwing lead
+    return {
+        "food": 700.0,
+        "enemy_danger": 12000.0,
+        "enemy_hunt": 1200.0,
+        "hunt_ratio": 0.60,
+        "merged_safe_ratio": 0.85,
+    }
+
 def choose_direction(game: Game) -> tuple[float, float]:
     global LAST_DIRECTION
 
@@ -358,6 +390,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
 
     step_distance = STEP_DISTANCE_MULT * player.radius
     cache = build_cache(game)
+    weights = get_mode_weights(player)
 
     #(total_score, x, y, first_direction, previous_direction)
     beam = [
@@ -382,13 +415,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
                 future_x = x + dx * step_distance
                 future_y = y + dy * step_distance
 
-                position_score = score_position(
-                    game,
-                    player,
-                    cache,
-                    future_x,
-                    future_y
-                )
+                position_score = score_position(player, cache, weights, future_x, future_y)
 
                 total_score = current_score + discount * position_score
 
@@ -434,6 +461,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
 
     return float(final_direction[0]), float(final_direction[1])
 
+    
 def main() -> None:
     game = Game()
 
