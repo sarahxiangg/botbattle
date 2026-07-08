@@ -50,10 +50,12 @@ MAX_FOOD_CONSIDERED = 25
 # Splitting
 # =========================
 
-SPLIT_EAT_RATIO = 1.20              # required size advantage
-SPLIT_RANGE_MULT = 4.0              # split reach estimate
-SPLIT_ALIGNMENT_MIN = 0.85          # must face target
-POST_SPLIT_DANGER_RANGE_MULT = 6.0  # danger scan range
+SPLIT_EAT_RATIO = 1.15              # required size advantage
+SPLIT_RANGE_MULT = 3.5              # split reach estimate
+SPLIT_ALIGNMENT_MIN = 0.88          # must face target
+POST_SPLIT_DANGER_RANGE_MULT = 5.0  # danger scan range
+
+SPLIT_MIN_RADIUS = 1.45
 
 # =========================
 # Walls
@@ -202,7 +204,7 @@ def split_penalty(game, split_radius):
 def get_split_decision(game, move_direction):
     player = game.state.me
 
-    if player.radius < 1.4:
+    if player.radius < SPLIT_MIN_RADIUS:
         return False, None
 
     #only split if we are a single blob
