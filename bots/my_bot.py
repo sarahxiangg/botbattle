@@ -99,6 +99,7 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     blob_locs = cache["blob_locs"]
     blob_rads = cache["blob_rads"]
     merged_rads = cache["merged_rads"]
+    potential_rads = cache["potential_rads"]
 
     if len(blob_locs) == 0:
         return 0.0
@@ -114,10 +115,11 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     individually_dangerous = blob_rads > player_radius * 1.1
 
     # Enemy as a whole is dangerous, but only treat as danger if close
+    future_dangerous = (potential_rads > player_radius * 1.15) & (edge_dists < player_radius * 5.0)
     merged_dangerous = (merged_rads > player_radius * 1.25) & (edge_dists < player_radius * 4.0)
 
-    bigger = individually_dangerous | merged_dangerous
-
+    bigger = individually_dangerous | merged_dangerous | future_dangerous
+    
     # Hunt small blobs unless the enemy's total visible mass is way too large
     EAT_RATIO = 1.12
     CLOSE_KILL_RANGE_MULT = 2.2
@@ -137,7 +139,7 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
 
     smaller = normal_hunt | close_kill
 
-    danger_size = np.maximum(blob_rads, merged_rads)
+    danger_size = np.maximum.reduce([blob_rads, merged_rads, potential_rads])
 
     danger_scores = danger_weight * (danger_size / player_radius) / (edge_dists ** 2)
     hunt_scores = hunt_weight * (player_radius / blob_rads) / (edge_dists ** 2)
@@ -445,11 +447,33 @@ def build_cache(game):
             merged_radius = np.sqrt(total_mass)
             merged_rads[same_player] = merged_radius
 
+        potential_rads = blob_rads.copy()
+
+        for i in range(len(blob_rads)):
+            predator_pos = blob_locs[i]
+            predator_rad = blob_rads[i]
+            predator_pid = blob_player_ids[i]
+
+            vectors = blob_locs - predator_pos
+            dists = np.linalg.norm(vectors, axis=1)
+            edge_dists = dists - predator_rad - blob_rads
+
+            different_player = blob_player_ids != predator_pid
+            can_eat = predator_rad > blob_rads * 1.12
+            very_close = edge_dists < predator_rad * 1.2
+
+            possible_prey = different_player & can_eat & very_close
+
+            if np.any(possible_prey):
+                prey_mass = np.max(blob_rads[possible_prey] ** 2)
+                potential_rads[i] = np.sqrt(predator_rad ** 2 + prey_mass)
+
     else:
         blob_locs = np.empty((0, 2), dtype=float)
         blob_rads = np.empty(0, dtype=float)
         blob_player_ids = np.empty(0, dtype=int)
         merged_rads = np.empty(0, dtype=float)
+        potential_rads = np.empty(0, dtype=float)
 
     # --- VIRUSES ---
     viruses = game.state.visible_viruses
@@ -469,6 +493,7 @@ def build_cache(game):
         "merged_rads": merged_rads,
         "virus_locs": virus_locs,
         "virus_rads": virus_rads,
+        "potential_rads": potential_rads
     }
 
 def get_mode_weights(player):
