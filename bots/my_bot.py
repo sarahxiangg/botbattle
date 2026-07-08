@@ -52,7 +52,7 @@ MAX_BLOBS_FOR_PREDICTION = 20
 # =========================
 
 SPLIT_EAT_RATIO = 1.15              # required size advantage
-SPLIT_RANGE_MULT = 3.5              # split reach estimate
+SPLIT_RANGE_MULT = 3.0              # split reach estimate
 SPLIT_ALIGNMENT_MIN = 0.88          # must face target
 POST_SPLIT_DANGER_RANGE_MULT = 5.0  # danger scan range
 
@@ -72,6 +72,10 @@ ARENA_SIZE = 60.0                 # map is 0..60 in both x/y
 WALL_DANGER_WEIGHT = 3000.0       # avoid wall edges
 WALL_MARGIN_MULT = 1.2            # avoid within 4 radii
 OFF_MAP_PENALTY = 1_000_000_000.0 # huge penalty if touching wall
+
+EAT_RATIO = 1.12
+CLOSE_KILL_RANGE_MULT = 2.2
+CLOSE_OVERRIDE_RANGE_MULT = 1.8
 
 
 '''
@@ -147,9 +151,6 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     bigger = individually_dangerous | merged_dangerous | future_dangerous
 
     # Hunt small blobs unless the enemy's total visible mass is way too large
-    EAT_RATIO = 1.12
-    CLOSE_KILL_RANGE_MULT = 2.2
-
     can_eat = player_radius > blob_rads * EAT_RATIO
 
     normal_hunt = (
@@ -317,26 +318,24 @@ def wall_score(player, x, y):
 
     return -WALL_DANGER_WEIGHT * (closeness ** 3)
 
-def split_penalty(game, split_radius):
-    player = game.state.me
+def split_penalty(cache, player, split_radius):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+
+    if len(blob_locs) == 0:
+        return False
+
     player_pos = np.array([player.x, player.y], dtype=float)
 
     danger_range = player.radius * POST_SPLIT_DANGER_RANGE_MULT
 
-    for blob in game.state.visible_blobs:
-        blob_pos = np.array(blob.pos, dtype=float)
+    dists = np.linalg.norm(blob_locs - player_pos, axis=1)
+    edge_dists = dists - split_radius - blob_rads
 
-        # Can this enemy eat our split piece?
-        if blob.radius <= split_radius * SPLIT_EAT_RATIO:
-            continue
+    can_eat_split_piece = blob_rads > split_radius * SPLIT_EAT_RATIO
+    too_close = edge_dists < danger_range
 
-        dist = np.linalg.norm(blob_pos - player_pos)
-        edge_dist = dist - split_radius - blob.radius
-
-        if edge_dist < danger_range:
-            return True
-
-    return False
+    return bool(np.any(can_eat_split_piece & too_close))
 
 def get_split_decision(game, move_direction, cache):
     player = game.state.me
@@ -368,7 +367,7 @@ def get_split_decision(game, move_direction, cache):
     split_range = player.radius * SPLIT_RANGE_MULT
 
     #do not split if splitting makes us vulnerable
-    if split_penalty(game, split_radius):
+    if split_penalty(cache, player, split_radius):
         return False, None
 
     best_target = None
@@ -584,23 +583,72 @@ def get_mode_weights(player):
         "merged_safe_ratio": 0.90,
     }
 
-def override_direction(cache, player, weights, step_distance):
-    # ---------- FOOD OVERRIDE ----------
-    if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
-        food_dir = food_direction(cache, player)
+def enemy_escape_direction(cache, player, step_distance):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
+    potential_rads = cache["potential_rads"]
 
-        if food_dir is not None:
-            dx, dy = food_dir
-            future_x = player.x + dx * step_distance
-            future_y = player.y + dy * step_distance
+    if len(blob_locs) == 0:
+        return None
 
-            if (
-                wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2 and
-                virus_score(cache, player, future_x, future_y, VIRUS_DANGER_WEIGHT, VIRUS_SAFE_WEIGHT) > -OFF_MAP_PENALTY / 2
-            ):
-                return dx, dy
+    player_pos = np.array([player.x, player.y], dtype=float)
+    player_radius = player.radius
 
-    # ---------- KILL OVERRIDE ----------
+    dists = np.linalg.norm(blob_locs - player_pos, axis=1)
+    edge_dists = dists - player_radius - blob_rads
+
+    danger_size = np.maximum.reduce([blob_rads, merged_rads, potential_rads])
+
+    dangerous = danger_size > player_radius * 1.10
+    too_close = edge_dists < player_radius * 2.5
+
+    if not np.any(dangerous & too_close):
+        return None
+
+    best_score = -float("inf")
+    best_direction = None
+
+    for direction in DIRECTIONS:
+        dx, dy = direction
+        future_x = player.x + dx * step_distance
+        future_y = player.y + dy * step_distance
+
+        score = 0.0
+
+        score += enemy_score(
+            cache,
+            player,
+            future_x,
+            future_y,
+            danger_weight=ENEMY_DANGER_WEIGHT,
+            hunt_weight=0.0,
+            hunt_ratio=0.0,
+            merged_safe_ratio=0.0,
+        )
+
+        score += enemy_split_threat_score(cache, player, future_x, future_y)
+        score += virus_score(cache, player, future_x, future_y, VIRUS_DANGER_WEIGHT, VIRUS_SAFE_WEIGHT)
+        score += wall_score(player, future_x, future_y)
+
+        if score > best_score:
+            best_score = score
+            best_direction = direction
+
+    if best_direction is None:
+        return None
+
+    return float(best_direction[0]), float(best_direction[1])
+
+def override_direction(cache, player, step_distance):
+    # ---------- ENEMY ESCAPE OVERRIDE ----------
+    escape_dir = enemy_escape_direction(cache, player, step_distance)
+
+    if escape_dir is not None:
+        return escape_dir
+    
+    # ---------- CLOSE KILL OVERRIDE ----------
+    # If a target is very close and edible, chase it before thinking about food.
     kill_dir = close_kill_direction(cache, player)
 
     if kill_dir is not None:
@@ -615,9 +663,22 @@ def override_direction(cache, player, weights, step_distance):
         ):
             return dx, dy
 
+    # ---------- FOOD OVERRIDE ----------
+    # Only use pure food direction when there are no threats/targets around.
+    if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
+        food_dir = food_direction(cache, player)
+
+        if food_dir is not None:
+            dx, dy = food_dir
+            future_x = player.x + dx * step_distance
+            future_y = player.y + dy * step_distance
+
+            if wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2:
+                return dx, dy
+
     return None
 
-def choose_direction(game: Game) -> tuple[float, float]:
+def choose_direction(game: Game):
     global LAST_DIRECTION
 
     player = game.state.me
@@ -626,7 +687,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
     cache = build_cache(game)
     weights = get_mode_weights(player)
 
-    override_dir = override_direction(cache, player, weights, step_distance)
+    override_dir = override_direction(cache, player, step_distance)
 
     if override_dir is not None:
         dx, dy = override_dir
