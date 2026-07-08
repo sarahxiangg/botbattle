@@ -525,7 +525,7 @@ def score_position(player, cache, weights, x, y):
 
 def build_cache(game):
     # --- OWN BLOBS ---
-    own_blobs = game.state.me.blobs
+    own_blobs = list(game.state.me.blobs.values())
 
     if own_blobs:
         own_locs = np.array([blob.pos for blob in own_blobs], dtype=float)
