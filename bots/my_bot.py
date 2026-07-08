@@ -44,9 +44,9 @@ STICKINESS_WEIGHT = 300.0                           # reward same direction
 ROLLOUT_STEPS = 2                 # future steps checked
 ROLLOUT_DISCOUNT = 0.7            # future score discount
 STEP_DISTANCE_MULT = 1.5          # step size multiplier
-BEAM_WIDTH = 3                    # paths kept per step
+BEAM_WIDTH = 2                    # paths kept per step
 TURN_PENALTY_WEIGHT = 150.0       # discourage sharp turns
-
+MAX_FOOD_CONSIDERED = 25
 
 # =========================
 # Splitting
@@ -92,6 +92,7 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight):
 
     blob_locs = cache["blob_locs"]
     blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
 
     if len(blob_locs) == 0:
         return 0.0
@@ -103,10 +104,12 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight):
     edge_dists = center_dists - player_radius - blob_rads
     edge_dists[edge_dists < 1.0] = 1.0
 
-    bigger = blob_rads > player_radius * 1.1
-    smaller = blob_rads < player_radius * 0.8
+    bigger = (blob_rads > player_radius * 1.1) | (merged_rads > player_radius * 1.1)
+    smaller = (blob_rads < player_radius * 0.65) & (merged_rads < player_radius * 0.9)
 
-    danger_scores = danger_weight * (blob_rads / player_radius) / (edge_dists ** 2)
+    danger_size = np.maximum(blob_rads, merged_rads)
+
+    danger_scores = danger_weight * (danger_size / player_radius) / (edge_dists ** 2)
     hunt_scores = hunt_weight * (player_radius / blob_rads) / (edge_dists ** 2)
 
     score = 0.0
@@ -298,6 +301,14 @@ def build_cache(game):
         food_locs = np.array([food.pos for food in foods], dtype=float)
     else:
         food_locs = np.empty((0, 2), dtype=float)
+    
+    if len(food_locs) > MAX_FOOD_CONSIDERED:
+        me = game.state.me
+        player_pos = np.array([me.x, me.y], dtype=float)
+
+        dists = np.sum((food_locs - player_pos) ** 2, axis=1)
+        keep = np.argpartition(dists, MAX_FOOD_CONSIDERED)[:MAX_FOOD_CONSIDERED]
+        food_locs = food_locs[keep]
 
     # --- ENEMY BLOBS ---
     blobs = game.state.visible_blobs
@@ -305,9 +316,20 @@ def build_cache(game):
     if blobs:
         blob_locs = np.array([blob.pos for blob in blobs], dtype=float)
         blob_rads = np.array([blob.radius for blob in blobs], dtype=float)
+        blob_player_ids = np.array([blob.player_id for blob in blobs], dtype=int)
+
+        merged_rads = np.zeros(len(blob_rads), dtype=float)
+        for pid in np.unique(blob_player_ids):
+            same_player = blob_player_ids == pid
+            total_mass = np.sum(blob_rads[same_player] ** 2)
+            merged_radius = np.sqrt(total_mass)
+            merged_rads[same_player] = merged_radius
+
     else:
         blob_locs = np.empty((0, 2), dtype=float)
         blob_rads = np.empty(0, dtype=float)
+        blob_player_ids = np.empty(0, dtype=int)
+        merged_rads = np.empty(0, dtype=float)
 
     # --- VIRUSES ---
     viruses = game.state.visible_viruses
@@ -323,6 +345,8 @@ def build_cache(game):
         "food_locs": food_locs,
         "blob_locs": blob_locs,
         "blob_rads": blob_rads,
+        "blob_player_ids": blob_player_ids,
+        "merged_rads": merged_rads,
         "virus_locs": virus_locs,
         "virus_rads": virus_rads,
     }
