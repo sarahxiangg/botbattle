@@ -21,7 +21,7 @@ DIRECTIONS = np.array([
 # Scoring weights
 # =========================
 
-ENEMY_DANGER_WEIGHT = 8000.0     # avoid bigger enemies
+ENEMY_DANGER_WEIGHT = 11000.0     # avoid bigger enemies
 VIRUS_DANGER_WEIGHT = 10000.0    # avoid dangerous viruses
 VIRUS_SAFE_WEIGHT = 200.0        # slight reward for safe viruses
 
@@ -45,6 +45,7 @@ STEP_DISTANCE_MULT = 1.5          # step size multiplier
 BEAM_WIDTH = 2                    # paths kept per step
 TURN_PENALTY_WEIGHT = 150.0       # discourage sharp turns
 MAX_FOOD_CONSIDERED = 25
+MAX_BLOBS_FOR_PREDICTION = 20
 
 # =========================
 # Splitting
@@ -275,12 +276,17 @@ def virus_score(cache, player, future_x, future_y, danger_weight, safety_weight)
     player_radius = player.radius
 
     center_dists = np.linalg.norm(virus_locs - future_pos, axis=1)
-
     edge_dists = center_dists - player_radius - virus_rads
-    edge_dists[edge_dists < 1.0] = 1.0
 
     dangerous = player_radius > virus_rads * 1.1
     safe = ~dangerous
+
+    # hard reject if we are basically colliding with a dangerous virus
+    if np.any(dangerous & (edge_dists < player_radius * 0.25)):
+        return -OFF_MAP_PENALTY
+
+    # do not clamp before the hard collision check
+    edge_dists[edge_dists < 1.0] = 1.0
 
     danger_scores = danger_weight / (edge_dists ** 3)
     safety_scores = safety_weight / (edge_dists ** 2)
@@ -474,24 +480,25 @@ def build_cache(game):
 
         potential_rads = blob_rads.copy()
 
-        for i in range(len(blob_rads)):
-            predator_pos = blob_locs[i]
-            predator_rad = blob_rads[i]
-            predator_pid = blob_player_ids[i]
+        if len(blob_rads) <= MAX_BLOBS_FOR_PREDICTION:
+            for i in range(len(blob_rads)):
+                predator_pos = blob_locs[i]
+                predator_rad = blob_rads[i]
+                predator_pid = blob_player_ids[i]
 
-            vectors = blob_locs - predator_pos
-            dists = np.linalg.norm(vectors, axis=1)
-            edge_dists = dists - predator_rad - blob_rads
+                vectors = blob_locs - predator_pos
+                dists = np.linalg.norm(vectors, axis=1)
+                edge_dists = dists - predator_rad - blob_rads
 
-            different_player = blob_player_ids != predator_pid
-            can_eat = predator_rad > blob_rads * 1.12
-            very_close = edge_dists < predator_rad * 1.2
+                different_player = blob_player_ids != predator_pid
+                can_eat = predator_rad > blob_rads * 1.12
+                very_close = edge_dists < predator_rad * 1.2
 
-            possible_prey = different_player & can_eat & very_close
+                possible_prey = different_player & can_eat & very_close
 
-            if np.any(possible_prey):
-                prey_mass = np.max(blob_rads[possible_prey] ** 2)
-                potential_rads[i] = np.sqrt(predator_rad ** 2 + prey_mass)
+                if np.any(possible_prey):
+                    prey_mass = np.max(blob_rads[possible_prey] ** 2)
+                    potential_rads[i] = np.sqrt(predator_rad ** 2 + prey_mass)
 
     else:
         blob_locs = np.empty((0, 2), dtype=float)
@@ -540,18 +547,18 @@ def get_mode_weights(player):
             "food": 1200.0,
             "enemy_danger": 5500.0,
             "enemy_hunt": 4500.0,
-            "hunt_ratio": 0.90,
-            "merged_safe_ratio": 1.20,
+            "hunt_ratio": 0.95,
+            "merged_safe_ratio": 1.30,
         }
 
     # Medium
     if r < 2.5:
         return {
             "food": 900.0,
-            "enemy_danger": 7500.0,
+            "enemy_danger": 8500.0,
             "enemy_hunt": 3000.0,
-            "hunt_ratio": 0.80,
-            "merged_safe_ratio": 1.05,
+            "hunt_ratio": 0.85,
+            "merged_safe_ratio": 1.15,
         }
 
     # Big
@@ -563,16 +570,8 @@ def get_mode_weights(player):
         "merged_safe_ratio": 0.90,
     }
 
-def choose_direction(game: Game) -> tuple[float, float]:
-    global LAST_DIRECTION
-
-    player = game.state.me
-
-    step_distance = STEP_DISTANCE_MULT * player.radius
-    cache = build_cache(game)
-    weights = get_mode_weights(player)
-
-    #FOOD OVERRIDE
+def override_direction(cache, player, weights, step_distance):
+    # ---------- FOOD OVERRIDE ----------
     if len(cache["blob_locs"]) == 0 and len(cache["virus_locs"]) == 0:
         food_dir = food_direction(cache, player)
 
@@ -581,11 +580,13 @@ def choose_direction(game: Game) -> tuple[float, float]:
             future_x = player.x + dx * step_distance
             future_y = player.y + dy * step_distance
 
-            if wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2:
-                LAST_DIRECTION = np.array([dx, dy], dtype=float)
+            if (
+                wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2 and
+                virus_score(cache, player, future_x, future_y, VIRUS_DANGER_WEIGHT, VIRUS_SAFE_WEIGHT) > -OFF_MAP_PENALTY / 2
+            ):
                 return dx, dy
 
-    #KILL OVERRIDE
+    # ---------- KILL OVERRIDE ----------
     kill_dir = close_kill_direction(cache, player)
 
     if kill_dir is not None:
@@ -595,10 +596,28 @@ def choose_direction(game: Game) -> tuple[float, float]:
 
         if (
             wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2 and
-            enemy_split_threat_score(cache, player, future_x, future_y) > -20000
+            enemy_split_threat_score(cache, player, future_x, future_y) > -20000 and
+            virus_score(cache, player, future_x, future_y, VIRUS_DANGER_WEIGHT, VIRUS_SAFE_WEIGHT) > -OFF_MAP_PENALTY / 2
         ):
-            LAST_DIRECTION = np.array([dx, dy], dtype=float)
             return dx, dy
+
+    return None
+
+def choose_direction(game: Game) -> tuple[float, float]:
+    global LAST_DIRECTION
+
+    player = game.state.me
+
+    step_distance = STEP_DISTANCE_MULT * player.radius
+    cache = build_cache(game)
+    weights = get_mode_weights(player)
+
+    override_dir = override_direction(cache, player, weights, step_distance)
+
+    if override_dir is not None:
+        dx, dy = override_dir
+        LAST_DIRECTION = np.array([dx, dy], dtype=float)
+        return dx, dy
 
     #(total_score, x, y, first_direction, previous_direction)
     beam = [
