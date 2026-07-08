@@ -37,6 +37,8 @@ TURN_PENALTY_WEIGHT = 80.0
 
 # Food farming
 FOOD_RUSH_MAX_RADIUS = 2.2
+FOOD_TARGET_REACHED_DIST_MULT = 0.40
+FOOD_TARGET_REACHED_MIN = 0.35
 
 # Danger override
 DANGER_OVERRIDE_RANGE_MULT = 9.0
@@ -500,11 +502,11 @@ def danger_avoidance_override(cache, step_distance):
 # Override 2: food farming
 # =========================
 
-def nearest_food_direction(cache):
+def ranked_food_directions(cache):
     food_locs = cache["food_locs"]
 
     if len(food_locs) == 0:
-        return None
+        return []
 
     player_pos = cache["player_pos"]
     player_radius = cache["player_radius"]
@@ -524,55 +526,95 @@ def nearest_food_direction(cache):
     vectors = target_locs - player_pos
     dists = np.linalg.norm(vectors, axis=1)
 
-    valid = dists > 0.15
+    reached_dist = max(
+        FOOD_TARGET_REACHED_MIN,
+        player_radius * FOOD_TARGET_REACHED_DIST_MULT,
+    )
+
+    # Key fix:
+    # if we are already close to the reachable point for this food,
+    # do not keep targeting it forever.
+    valid = dists > reached_dist
 
     if not np.any(valid):
-        return None
+        return []
+
+    safe_dists = dists.copy()
+    safe_dists[safe_dists < 1.0] = 1.0
 
     scores = np.full(len(dists), -1.0)
-    scores[valid] = 1.0 / dists[valid]
+    scores[valid] = 1.0 / safe_dists[valid]
 
-    idx = int(np.argmax(scores))
+    candidate_indices = np.argsort(scores)[::-1]
 
-    direction = normalize(vectors[idx])
+    candidates = []
 
-    if direction is None:
-        return None
+    for idx in candidate_indices:
+        if scores[idx] <= 0:
+            break
 
-    return float(direction[0]), float(direction[1])
+        direction = normalize(vectors[idx])
+
+        if direction is None:
+            continue
+
+        candidates.append(
+            (
+                float(scores[idx]),
+                float(direction[0]),
+                float(direction[1]),
+            )
+        )
+
+    return candidates
 
 
 def food_farming_override(cache, step_distance):
     if cache["own_blob_count"] == 1 and cache["player_radius"] >= FOOD_RUSH_MAX_RADIUS:
         return None
 
-    food_dir = nearest_food_direction(cache)
+    food_candidates = ranked_food_directions(cache)
 
-    if food_dir is None:
+    if not food_candidates:
         return None
 
-    dx, dy = food_dir
+    for _, dx, dy in food_candidates:
+        future_x = cache["player_x"] + dx * step_distance
+        future_y = cache["player_y"] + dy * step_distance
+        future_x, future_y = clamp_position(cache, future_x, future_y)
 
-    future_x = cache["player_x"] + dx * step_distance
-    future_y = cache["player_y"] + dy * step_distance
-    future_x, future_y = clamp_position(cache, future_x, future_y)
+        actual_move = np.linalg.norm(
+            np.array(
+                [
+                    future_x - cache["player_x"],
+                    future_y - cache["player_y"],
+                ],
+                dtype=float,
+            )
+        )
 
-    if movement_virus_score(
-        cache,
-        cache["player_x"],
-        cache["player_y"],
-        future_x,
-        future_y,
-    ) <= -OFF_MAP_PENALTY / 2:
-        return None
+        # Avoid directions that mostly just push into the wall.
+        if actual_move < step_distance * 0.25:
+            continue
 
-    if own_blob_virus_score(cache, dx, dy, step_distance) <= -OFF_MAP_PENALTY / 2:
-        return None
+        if movement_virus_score(
+            cache,
+            cache["player_x"],
+            cache["player_y"],
+            future_x,
+            future_y,
+        ) <= -OFF_MAP_PENALTY / 2:
+            continue
 
-    if not move_safe_from_enemies(cache, dx, dy, step_distance):
-        return None
+        if own_blob_virus_score(cache, dx, dy, step_distance) <= -OFF_MAP_PENALTY / 2:
+            continue
 
-    return dx, dy, False
+        if not move_safe_from_enemies(cache, dx, dy, step_distance):
+            continue
+
+        return dx, dy, False
+
+    return None
 
 
 # =========================
