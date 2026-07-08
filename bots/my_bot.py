@@ -62,35 +62,33 @@ OFF_MAP_PENALTY = 1_000_000_000.0 # huge penalty if touching wall
 
 
 '''
-    Vector functions: food_score, enemy_score
+    Vector functions: food_score, enemy_score, virus_score, wall score
+    Split functions: get_split_decision -> (yes/no, direction), split_penalty (if too dangerous)
 '''
 
-def food_score(game, player, future_x, future_y, weight):
-    foods = game.state.visible_food
+def food_score(cache, future_x, future_y, weight):
+    food_locs = cache["food_locs"]
 
-    if not foods:
+    if len(food_locs) == 0:
         return 0.0
 
     future_pos = np.array([future_x, future_y], dtype=float)
-    food_locs = np.array([food.pos for food in foods], dtype=float)
     
     dists = np.linalg.norm(food_locs - future_pos, axis=1)
-    dists[dists == 0] = 1.0
+    dists[dists < 1.0] = 1.0
     scores = weight / (dists**2)
 
     return float(np.sum(scores))
 
 
-def enemy_score(game, player, future_x, future_y, danger_weight, hunt_weight):
-    blobs = game.state.visible_blobs
-
-    if not blobs:
-        return 0.0
-
+def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight):
     future_pos = np.array([future_x, future_y], dtype=float)
 
-    blob_locs = np.array([blob.pos for blob in blobs], dtype=float)
-    blob_rads = np.array([blob.radius for blob in blobs], dtype=float)
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+
+    if len(blob_locs) == 0:
+        return 0.0
 
     player_radius = player.radius
 
@@ -110,6 +108,57 @@ def enemy_score(game, player, future_x, future_y, danger_weight, hunt_weight):
     score += np.sum(hunt_scores[smaller])
 
     return float(score)
+
+
+def virus_score(cache, player, future_x, future_y, danger_weight, safety_weight):
+    future_pos = np.array([future_x, future_y], dtype=float)
+
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if len(virus_locs) == 0:
+        return 0.0
+
+    player_radius = player.radius
+
+    center_dists = np.linalg.norm(virus_locs - future_pos, axis=1)
+
+    edge_dists = center_dists - player_radius - virus_rads
+    edge_dists[edge_dists < 1.0] = 1.0
+
+    dangerous = player_radius > virus_rads * 1.1
+    safe = ~dangerous
+
+    danger_scores = danger_weight / (edge_dists ** 3)
+    safety_scores = safety_weight / (edge_dists ** 2)
+
+    score = 0.0
+    score -= np.sum(danger_scores[dangerous])
+    score += np.sum(safety_scores[safe])
+
+    return float(score)
+
+def wall_score(player, x, y):
+    # distance from blob edge to each wall
+    left = x - player.radius
+    right = ARENA_SIZE - x - player.radius
+    bottom = y - player.radius
+    top = ARENA_SIZE - y - player.radius
+
+    nearest_wall = min(left, right, bottom, top)
+
+    # if our blob would touch/go outside the wall
+    if nearest_wall <= 0:
+        return -OFF_MAP_PENALTY
+
+    safe_margin = WALL_MARGIN_MULT * player.radius
+
+    # far from wall = no penalty
+    if nearest_wall >= safe_margin:
+        return 0.0
+
+    # closer wall = stronger penalty
+    return -WALL_DANGER_WEIGHT / (nearest_wall ** 2)
 
 def split_penalty(game, split_radius):
     player = game.state.me
@@ -199,71 +248,18 @@ def get_split_decision(game, move_direction):
     return True, best_target
 
 
-def virus_score(game, player, future_x, future_y, danger_weight, safety_weight):
-    viruses = game.state.visible_viruses
-
-    if not viruses:
-        return 0.0
-
-    future_pos = np.array([future_x, future_y], dtype=float)
-
-    virus_locs = np.array([virus.pos for virus in viruses], dtype=float)
-    virus_rads = np.array([virus.radius for virus in viruses], dtype=float)
-
-    player_radius = player.radius
-
-    center_dists = np.linalg.norm(virus_locs - future_pos, axis=1)
-
-    edge_dists = center_dists - player_radius - virus_rads
-    edge_dists[edge_dists < 1.0] = 1.0
-
-    dangerous = player_radius > virus_rads * 1.1
-    safe = ~dangerous
-
-    danger_scores = danger_weight / (edge_dists ** 3)
-    safety_scores = safety_weight / (edge_dists ** 2)
-
-    score = 0.0
-    score -= np.sum(danger_scores[dangerous])
-    score += np.sum(safety_scores[safe])
-
-    return float(score)
-
-def wall_score(player, x, y):
-    # distance from blob edge to each wall
-    left = x - player.radius
-    right = ARENA_SIZE - x - player.radius
-    bottom = y - player.radius
-    top = ARENA_SIZE - y - player.radius
-
-    nearest_wall = min(left, right, bottom, top)
-
-    # if our blob would touch/go outside the wall
-    if nearest_wall <= 0:
-        return -OFF_MAP_PENALTY
-
-    safe_margin = WALL_MARGIN_MULT * player.radius
-
-    # far from wall = no penalty
-    if nearest_wall >= safe_margin:
-        return 0.0
-
-    # closer wall = stronger penalty
-    return -WALL_DANGER_WEIGHT / (nearest_wall ** 2)
-
-def score_position(game, player, x, y):
+def score_position(game, player, cache, x, y):
     score = 0.0
 
     score += food_score(
-        game,
-        player,
+        cache,
         x,
         y,
         weight=FOOD_WEIGHT
     )
 
     score += enemy_score(
-        game,
+        cache,
         player,
         x,
         y,
@@ -272,7 +268,7 @@ def score_position(game, player, x, y):
     )
 
     score += virus_score(
-        game,
+        cache,
         player,
         x,
         y,
@@ -286,7 +282,44 @@ def score_position(game, player, x, y):
         y
     )
 
-    return score
+    return score 
+
+def build_cache(game):
+    # --- FOOD ---
+    foods = game.state.visible_food
+
+    if foods:
+        food_locs = np.array([food.pos for food in foods], dtype=float)
+    else:
+        food_locs = np.empty((0, 2), dtype=float)
+
+    # --- ENEMY BLOBS ---
+    blobs = game.state.visible_blobs
+
+    if blobs:
+        blob_locs = np.array([blob.pos for blob in blobs], dtype=float)
+        blob_rads = np.array([blob.radius for blob in blobs], dtype=float)
+    else:
+        blob_locs = np.empty((0, 2), dtype=float)
+        blob_rads = np.empty(0, dtype=float)
+
+    # --- VIRUSES ---
+    viruses = game.state.visible_viruses
+
+    if viruses:
+        virus_locs = np.array([virus.pos for virus in viruses], dtype=float)
+        virus_rads = np.array([virus.radius for virus in viruses], dtype=float)
+    else:
+        virus_locs = np.empty((0, 2), dtype=float)
+        virus_rads = np.empty(0, dtype=float)
+
+    return {
+        "food_locs": food_locs,
+        "blob_locs": blob_locs,
+        "blob_rads": blob_rads,
+        "virus_locs": virus_locs,
+        "virus_rads": virus_rads,
+    }
 
 def choose_direction(game: Game) -> tuple[float, float]:
     global LAST_DIRECTION
@@ -296,6 +329,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
     step_distance = STEP_DISTANCE_MULT * player.radius
 
     directions = []
+    cache = build_cache(game)
 
     for i in range(NUM_DIRECTIONS):
         angle = 2 * np.pi * i / NUM_DIRECTIONS
@@ -328,6 +362,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
                 position_score = score_position(
                     game,
                     player,
+                    cache,
                     future_x,
                     future_y
                 )
