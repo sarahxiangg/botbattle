@@ -55,7 +55,13 @@ SPLIT_RANGE_MULT = 3.5              # split reach estimate
 SPLIT_ALIGNMENT_MIN = 0.88          # must face target
 POST_SPLIT_DANGER_RANGE_MULT = 5.0  # danger scan range
 
-SPLIT_MIN_RADIUS = 1.45
+SPLIT_MIN_RADIUS = 1.45             # min distance to consider a split
+
+
+ENEMY_SPLIT_THREAT_WEIGHT = 30000.0
+ENEMY_SPLIT_RANGE_MULT = 4.0
+ENEMY_SPLIT_EAT_RATIO = 1.08
+ENEMY_SPLIT_CONE_ALIGNMENT = 0.65
 
 # =========================
 # Walls
@@ -128,6 +134,61 @@ def enemy_score(cache, player, future_x, future_y, danger_weight, hunt_weight, h
     score += np.sum(hunt_scores[smaller])
 
     return float(score)
+
+def enemy_split_threat_score(cache, player, future_x, future_y):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+
+    if len(blob_locs) == 0:
+        return 0.0
+
+    player_radius = player.radius
+
+    current_pos = np.array([player.x, player.y], dtype=float)
+    future_pos = np.array([future_x, future_y], dtype=float)
+
+    enemy_split_rads = blob_rads / np.sqrt(2.0)
+
+    # Only care about enemies whose split piece can eat us
+    can_split_eat_us = enemy_split_rads > player_radius * ENEMY_SPLIT_EAT_RATIO
+
+    if not np.any(can_split_eat_us):
+        return 0.0
+
+    to_current = current_pos - blob_locs
+    to_future = future_pos - blob_locs
+
+    dist_current = np.linalg.norm(to_current, axis=1)
+    dist_future = np.linalg.norm(to_future, axis=1)
+
+    dist_current[dist_current < 1.0] = 1.0
+    dist_future[dist_future < 1.0] = 1.0
+
+    unit_current = to_current / dist_current.reshape(-1, 1)
+    unit_future = to_future / dist_future.reshape(-1, 1)
+
+    # Are we staying in the direction they would naturally split toward?
+    alignment = np.sum(unit_current * unit_future, axis=1)
+
+    split_reach = blob_rads * ENEMY_SPLIT_RANGE_MULT
+    edge_dist = dist_future - enemy_split_rads - player_radius
+
+    in_split_range = edge_dist < split_reach
+    in_split_cone = alignment > ENEMY_SPLIT_CONE_ALIGNMENT
+
+    threatened = can_split_eat_us & in_split_range & in_split_cone
+
+    if not np.any(threatened):
+        return 0.0
+
+    closeness = (split_reach - edge_dist) / split_reach
+    closeness = np.clip(closeness, 0.0, 1.0)
+
+    size_ratio = enemy_split_rads / player_radius
+
+    threat_scores = ENEMY_SPLIT_THREAT_WEIGHT * size_ratio * (closeness ** 2)
+
+    return -float(np.sum(threat_scores[threatened]))
 
 
 def virus_score(cache, player, future_x, future_y, danger_weight, safety_weight):
@@ -307,6 +368,13 @@ def score_position(player, cache, weights, x, y):
         y
     )
 
+    score += enemy_split_threat_score(
+        cache,
+        player,
+        x,
+        y
+    )
+
     return score 
 
 def build_cache(game):
@@ -370,17 +438,27 @@ def build_cache(game):
 def get_mode_weights(player):
     r = player.radius
 
-    # Small: need growth, take more food, opportunistic hunts
-    if r < 1.5:
+    # Tiny/start: farm food, do not chase unless it is a free close kill
+    if r < 1.2:
         return {
-            "food": 1200.0,
-            "enemy_danger": 5000.0,
-            "enemy_hunt": 4500.0,
-            "hunt_ratio": 0.95,
-            "merged_safe_ratio": 1.25,
+            "food": 1600.0,
+            "enemy_danger": 7000.0,
+            "enemy_hunt": 800.0,
+            "hunt_ratio": 0.55,
+            "merged_safe_ratio": 0.80,
         }
 
-    # Medium: balanced
+    # Small but viable: now start hunting aggressively
+    if r < 1.7:
+        return {
+            "food": 1200.0,
+            "enemy_danger": 5500.0,
+            "enemy_hunt": 4500.0,
+            "hunt_ratio": 0.90,
+            "merged_safe_ratio": 1.20,
+        }
+
+    # Medium
     if r < 2.5:
         return {
             "food": 900.0,
@@ -390,7 +468,7 @@ def get_mode_weights(player):
             "merged_safe_ratio": 1.05,
         }
 
-    # Big: survival, avoid throwing lead
+    # Big
     return {
         "food": 700.0,
         "enemy_danger": 11000.0,
