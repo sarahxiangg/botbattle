@@ -68,8 +68,8 @@ ENEMY_SPLIT_CONE_ALIGNMENT = 0.65
 # =========================
 
 ARENA_SIZE = 60.0                 # map is 0..60 in both x/y
-WALL_DANGER_WEIGHT = 50000.0      # avoid wall edges
-WALL_MARGIN_MULT = 4.0            # avoid within 4 radii
+WALL_DANGER_WEIGHT = 12000.0      # avoid wall edges
+WALL_MARGIN_MULT = 2.2            # avoid within 4 radii
 OFF_MAP_PENALTY = 1_000_000_000.0 # huge penalty if touching wall
 
 
@@ -265,7 +265,6 @@ def virus_score(cache, player, future_x, future_y, danger_weight, safety_weight)
     return float(score)
 
 def wall_score(player, x, y):
-    # distance from blob edge to each wall
     left = x - player.radius
     right = ARENA_SIZE - x - player.radius
     bottom = y - player.radius
@@ -273,18 +272,17 @@ def wall_score(player, x, y):
 
     nearest_wall = min(left, right, bottom, top)
 
-    # if our blob would touch/go outside the wall
     if nearest_wall <= 0:
         return -OFF_MAP_PENALTY
 
     safe_margin = WALL_MARGIN_MULT * player.radius
 
-    # far from wall = no penalty
     if nearest_wall >= safe_margin:
         return 0.0
 
-    # closer wall = stronger penalty
-    return -WALL_DANGER_WEIGHT / (nearest_wall ** 2)
+    closeness = (safe_margin - nearest_wall) / safe_margin
+
+    return -WALL_DANGER_WEIGHT * (closeness ** 2)
 
 def split_penalty(game, split_radius):
     player = game.state.me
@@ -413,13 +411,6 @@ def score_position(player, cache, weights, x, y):
         y
     )
 
-    score += enemy_split_threat_score(
-        cache,
-        player,
-        x,
-        y
-    )
-
     return score 
 
 def build_cache(game):
@@ -539,7 +530,7 @@ def choose_direction(game: Game) -> tuple[float, float]:
         future_y = player.y + dy * step_distance
 
         if (
-            wall_score(player, future_x, future_y) > -10000 and
+            wall_score(player, future_x, future_y) > -OFF_MAP_PENALTY / 2 and
             enemy_split_threat_score(cache, player, future_x, future_y) > -20000
         ):
             LAST_DIRECTION = np.array([dx, dy], dtype=float)
@@ -569,6 +560,14 @@ def choose_direction(game: Game) -> tuple[float, float]:
                 future_y = y + dy * step_distance
 
                 position_score = score_position(player, cache, weights, future_x, future_y)
+
+                if step == 1:
+                    position_score += enemy_split_threat_score(
+                        cache,
+                        player,
+                        x,
+                        y
+                    )
 
                 total_score = current_score + discount * position_score
 
