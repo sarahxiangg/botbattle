@@ -117,6 +117,11 @@ CHASE_LEAD_TICKS = 2.2
 CHASE_WALL_COMMIT_DIST = 8.0
 CHASE_MIN_CLOSING_RATE = -0.15
 
+# Virus memory
+VIRUS_MEMORY = {}
+VIRUS_MEMORY_REACHED_DIST_MULT = 1.4
+VIRUS_MEMORY_KEY_DECIMALS = 1
+
 
 # =========================
 # Basic utilities
@@ -643,6 +648,58 @@ def split_kill_mode(cache, step_distance):
 # Mode 3: virus farm
 # =========================
 
+def virus_key(pos):
+    return (
+        round(float(pos[0]), VIRUS_MEMORY_KEY_DECIMALS),
+        round(float(pos[1]), VIRUS_MEMORY_KEY_DECIMALS),
+    )
+
+
+def update_virus_memory(cache):
+    """
+    Remember every virus we see.
+    If we visit a remembered virus location and it is no longer there,
+    remove it from memory.
+    """
+    global VIRUS_MEMORY
+
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    visible_keys = set()
+
+    # Add / refresh currently visible viruses.
+    for pos, rad in zip(virus_locs, virus_rads):
+        key = virus_key(pos)
+        visible_keys.add(key)
+
+        VIRUS_MEMORY[key] = {
+            "pos": np.array(pos, dtype=float),
+            "radius": float(rad),
+        }
+
+    # Remove remembered viruses if we reached their location and they are gone.
+    reached_dist = max(
+        1.0,
+        player_radius * VIRUS_MEMORY_REACHED_DIST_MULT,
+    )
+
+    expired = []
+
+    for key, info in VIRUS_MEMORY.items():
+        if key in visible_keys:
+            continue
+
+        dist = np.linalg.norm(info["pos"] - player_pos)
+
+        if dist < reached_dist:
+            expired.append(key)
+
+    for key in expired:
+        del VIRUS_MEMORY[key]
+
 def virus_farm_enemy_safe(cache, virus_pos, virus_rad):
     blob_locs = cache["blob_locs"]
     blob_rads = cache["blob_rads"]
@@ -677,49 +734,92 @@ def virus_farm_mode(cache, step_distance):
     if cache["own_blob_count"] != 1:
         return None
 
-    virus_locs = cache["virus_locs"]
-    virus_rads = cache["virus_rads"]
-
-    if len(virus_locs) == 0:
-        return None
-
     player_pos = cache["player_pos"]
     player_radius = cache["player_radius"]
 
-    vectors = virus_locs - player_pos
-    dists = np.linalg.norm(vectors, axis=1)
+    # Build candidates from virus memory, not just visible viruses.
+    candidates = []
 
-    safe_dists = dists.copy()
-    safe_dists[safe_dists < 1.0] = 1.0
+    for key, info in VIRUS_MEMORY.items():
+        virus_pos = info["pos"]
+        virus_rad = info["radius"]
 
-    # Only farm when physically possible.
-    can_farm = player_radius > virus_rads * VIRUS_FARM_EAT_RATIO
-
-    if not np.any(can_farm):
-        return None
-
-    scores = 1.0 / safe_dists
-    scores[~can_farm] = -1.0
-
-    for idx in np.argsort(scores)[::-1]:
-        if scores[idx] <= 0:
-            break
-
-        virus_pos = virus_locs[idx]
-        virus_rad = virus_rads[idx]
-
-        if not virus_farm_enemy_safe(cache, virus_pos, virus_rad):
+        # Only go if physically big enough to farm it.
+        if player_radius <= virus_rad * VIRUS_FARM_EAT_RATIO:
             continue
 
-        direction = normalize(vectors[idx])
+        dist = np.linalg.norm(virus_pos - player_pos)
+
+        candidates.append((
+            dist,
+            key,
+            virus_pos,
+            virus_rad,
+        ))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+
+    visible_keys = {
+        virus_key(pos)
+        for pos in cache["virus_locs"]
+    }
+
+    for dist, key, virus_pos, virus_rad in candidates:
+        # If we reached a remembered virus and it is not visible, delete it.
+        reached_dist = max(
+            1.0,
+            player_radius * VIRUS_MEMORY_REACHED_DIST_MULT,
+        )
+
+        if dist < reached_dist and key not in visible_keys:
+            if key in VIRUS_MEMORY:
+                del VIRUS_MEMORY[key]
+            continue
+
+        # If the virus is currently visible, check post-pop enemy safety.
+        # If it is not visible yet, we can still travel toward it, but safely.
+        is_visible = key in visible_keys
+
+        if is_visible:
+            if not virus_farm_enemy_safe(cache, virus_pos, virus_rad):
+                continue
+
+        direction = normalize(virus_pos - player_pos)
 
         if direction is None:
             continue
 
         dx, dy = float(direction[0]), float(direction[1])
 
-        # Intentional virus contact, so only enemy danger is checked here.
-        if not danger_report(cache, dx, dy, step_distance, check_virus=False)["enemy_safe"]:
+        if is_visible:
+            # Intentional virus contact: enemy safety only.
+            report = danger_report(
+                cache,
+                dx,
+                dy,
+                step_distance,
+                check_virus=False,
+            )
+
+            if not report["enemy_safe"]:
+                continue
+        else:
+            # Travelling toward remembered virus: still avoid currently visible viruses.
+            report = danger_report(
+                cache,
+                dx,
+                dy,
+                step_distance,
+                check_virus=True,
+            )
+
+            if not report["safe"]:
+                continue
+
+        if report["actual_move"] < step_distance * 0.20:
             continue
 
         return dx, dy, False
@@ -1424,6 +1524,8 @@ def choose_direction(game: Game):
 
     cache = build_cache(game)
     update_enemy_velocity(cache)
+    update_virus_memory(cache)
+    
     step_distance = STEP_DISTANCE_MULT * cache["player_radius"]
 
     # Strategic priority order:
