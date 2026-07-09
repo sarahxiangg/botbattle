@@ -81,16 +81,17 @@ VIRUS_HARD_BUFFER_MULT = 0.65
 VIRUS_PATH_BUFFER_MULT = 0.65
 VIRUS_FARM_EAT_RATIO = 1.10
 VIRUS_FARM_ENEMY_RANGE_MULT = 8.0
-VIRUS_FARM_PIECE_RADIUS_MULT = 0.45
+VIRUS_FARM_PIECE_RADIUS_MULT = 0.35
 
 # Split kill
 SPLIT_MIN_RADIUS = 1.35
 SPLIT_EAT_RATIO = 1.10
-SPLIT_RANGE_MULT = 3.0
-SPLIT_RANGE_SAFETY_MULT = 0.88
+SPLIT_RANGE_MULT = 2.5
+SPLIT_RANGE_SAFETY_MULT = 0.75
 SPLIT_TARGET_MIN_RADIUS_MULT = 0.16
 SPLIT_VIRUS_BUFFER_MULT = 1.3
 POST_SPLIT_DANGER_RANGE_MULT = 5.5
+SPLIT_ALIGNMENT_MIN = 0.92
 
 # Stuck safety net
 WALL_BUFFER = 0.25
@@ -530,6 +531,27 @@ def split_path_safe(cache, split_radius, split_landing):
 
     return score > -OFF_MAP_PENALTY / 2
 
+def split_can_reach_target(player_pos, player_radius, target_pos, target_radius):
+    split_radius = player_radius / np.sqrt(2.0)
+    split_range = player_radius * SPLIT_RANGE_MULT * SPLIT_RANGE_SAFETY_MULT
+
+    vector = target_pos - player_pos
+    dist = np.linalg.norm(vector)
+
+    if dist <= 1e-9:
+        return False
+
+    direction = vector / dist
+
+    landing = player_pos + direction * split_range
+
+    # How close the landing blob centre gets to target centre.
+    landing_dist = np.linalg.norm(target_pos - landing)
+
+    # Require overlap with a strict buffer.
+    hit_radius = split_radius + target_radius
+
+    return landing_dist <= hit_radius * 0.75
 
 def split_kill_mode(cache, step_distance):
     if cache["own_blob_count"] != 1:
@@ -551,6 +573,8 @@ def split_kill_mode(cache, step_distance):
     safe_dists[safe_dists < 1.0] = 1.0
     dirs = vectors / safe_dists.reshape(-1, 1)
 
+    alignment = np.sum(dirs * dirs, axis=1)
+
     can_eat_now = player_radius > blob_rads * EAT_RATIO
 
     if not np.any(can_eat_now):
@@ -560,14 +584,17 @@ def split_kill_mode(cache, step_distance):
     split_range = player_radius * SPLIT_RANGE_MULT
 
     useful_target = blob_rads > player_radius * SPLIT_TARGET_MIN_RADIUS_MULT
-    hit_reach = split_range * SPLIT_RANGE_SAFETY_MULT + split_radius + blob_rads
+    reach_ok = np.array([
+        split_can_reach_target(player_pos, player_radius, blob_locs[i], blob_rads[i])
+        for i in range(len(blob_locs))
+    ], dtype=bool)
 
     candidates = (
         (player_radius >= SPLIT_MIN_RADIUS)
         & (split_radius > blob_rads * SPLIT_EAT_RATIO)
-        & (dists <= hit_reach)
         & useful_target
         & can_eat_now
+        & reach_ok
     )
 
     if not np.any(candidates):
