@@ -103,6 +103,20 @@ STUCK_MOVE_WEIGHT = 2000.0
 LAST_POSITION = None
 STUCK_TICKS = 0
 
+#chase prediction
+ENEMY_LAST_POS = {}
+ENEMY_VEL = {}
+
+CHASE_TARGET_KEY = None
+CHASE_TARGET_TICKS = 0
+CHASE_LOST_TICKS = 0
+
+CHASE_LOCK_TICKS = 14
+CHASE_LOST_LIMIT = 4
+CHASE_LEAD_TICKS = 2.2
+CHASE_WALL_COMMIT_DIST = 8.0
+CHASE_MIN_CLOSING_RATE = -0.15
+
 
 # =========================
 # Basic utilities
@@ -573,8 +587,6 @@ def split_kill_mode(cache, step_distance):
     safe_dists[safe_dists < 1.0] = 1.0
     dirs = vectors / safe_dists.reshape(-1, 1)
 
-    alignment = np.sum(dirs * dirs, axis=1)
-
     can_eat_now = player_radius > blob_rads * EAT_RATIO
 
     if not np.any(can_eat_now):
@@ -719,14 +731,157 @@ def virus_farm_mode(cache, step_distance):
 # Mode 4: chase
 # =========================
 
+def update_enemy_velocity(cache):
+    """
+    Estimate enemy velocities from the previous tick.
+
+    We do not assume blob IDs exist. Instead, for each player_id, we match each
+    current blob to the closest previous blob from the same player. This is not
+    perfect, but it is stable enough for lead-pursuit chasing.
+    """
+    global ENEMY_LAST_POS, ENEMY_VEL
+
+    blob_locs = cache["blob_locs"]
+    blob_player_ids = cache["blob_player_ids"]
+
+    blob_vels = np.zeros_like(blob_locs, dtype=float)
+
+    if len(blob_locs) == 0:
+        ENEMY_LAST_POS = {}
+        ENEMY_VEL = {}
+        cache["blob_vels"] = blob_vels
+        return
+
+    previous_by_pid = {}
+    for key, pos in ENEMY_LAST_POS.items():
+        pid = key[0]
+        previous_by_pid.setdefault(pid, []).append((key, pos))
+
+    new_last = {}
+    new_vel = {}
+
+    for pid in np.unique(blob_player_ids):
+        indices = np.where(blob_player_ids == pid)[0]
+        previous = previous_by_pid.get(int(pid), [])
+        used_previous = set()
+
+        for local_num, idx in enumerate(indices):
+            pos = blob_locs[idx].copy()
+            best_prev_key = None
+            best_prev_pos = None
+            best_dist = float("inf")
+
+            for prev_key, prev_pos in previous:
+                if prev_key in used_previous:
+                    continue
+
+                dist = float(np.sum((pos - prev_pos) ** 2))
+
+                if dist < best_dist:
+                    best_dist = dist
+                    best_prev_key = prev_key
+                    best_prev_pos = prev_pos
+
+            if best_prev_pos is None:
+                vel = np.array([0.0, 0.0], dtype=float)
+            else:
+                vel = pos - best_prev_pos
+                used_previous.add(best_prev_key)
+
+            # Clamp extreme tracking jumps so bad matching does not cause insane prediction.
+            speed = np.linalg.norm(vel)
+            max_reasonable_speed = cache["player_radius"] * 2.5
+            if speed > max_reasonable_speed and speed > 1e-9:
+                vel = vel / speed * max_reasonable_speed
+
+            # Store per current blob index.
+            blob_vels[idx] = vel
+
+            # Current key only needs to be unique within this tick/player.
+            new_key = (int(pid), int(local_num))
+            new_last[new_key] = pos
+            new_vel[new_key] = vel
+
+    ENEMY_LAST_POS = new_last
+    ENEMY_VEL = new_vel
+    cache["blob_vels"] = blob_vels
+
+
+def enemy_near_wall_or_corner(pos):
+    x, y = pos
+
+    dist_left = x
+    dist_right = ARENA_SIZE - x
+    dist_bottom = y
+    dist_top = ARENA_SIZE - y
+
+    nearest_wall_dist = min(dist_left, dist_right, dist_bottom, dist_top)
+
+    near_wall = nearest_wall_dist < CHASE_WALL_COMMIT_DIST
+
+    near_corner = (
+        (dist_left < CHASE_WALL_COMMIT_DIST or dist_right < CHASE_WALL_COMMIT_DIST)
+        and
+        (dist_bottom < CHASE_WALL_COMMIT_DIST or dist_top < CHASE_WALL_COMMIT_DIST)
+    )
+
+    return near_wall or near_corner
+
+
+def predicted_enemy_position(cache, idx, lead_ticks):
+    blob_locs = cache["blob_locs"]
+    blob_vels = cache.get("blob_vels")
+
+    pos = blob_locs[idx]
+
+    if blob_vels is None or len(blob_vels) <= idx:
+        vel = np.array([0.0, 0.0], dtype=float)
+    else:
+        vel = blob_vels[idx]
+
+    predicted = pos + vel * lead_ticks
+
+    # Keep prediction inside board.
+    predicted_x = min(max(predicted[0], 0.0), ARENA_SIZE)
+    predicted_y = min(max(predicted[1], 0.0), ARENA_SIZE)
+
+    return np.array([predicted_x, predicted_y], dtype=float), vel
+
+
+def enemy_running_toward_wall(pos, vel):
+    """Return True if the enemy's velocity is carrying it toward the nearest wall."""
+    speed = np.linalg.norm(vel)
+
+    if speed <= 1e-9:
+        return False
+
+    x, y = pos
+    wall_vectors = [
+        np.array([-1.0, 0.0], dtype=float) if x < ARENA_SIZE / 2.0 else np.array([1.0, 0.0], dtype=float),
+        np.array([0.0, -1.0], dtype=float) if y < ARENA_SIZE / 2.0 else np.array([0.0, 1.0], dtype=float),
+    ]
+
+    vel_dir = vel / speed
+    return any(np.dot(vel_dir, wall_dir) > 0.55 for wall_dir in wall_vectors)
+
+
 def chase_mode(cache, step_distance):
+    global CHASE_TARGET_KEY, CHASE_TARGET_TICKS, CHASE_LOST_TICKS
+
     if cache["own_blob_count"] != 1:
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
         return None
 
     blob_locs = cache["blob_locs"]
     blob_rads = cache["blob_rads"]
+    blob_player_ids = cache["blob_player_ids"]
 
     if len(blob_locs) == 0:
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
         return None
 
     player_pos = cache["player_pos"]
@@ -734,37 +889,129 @@ def chase_mode(cache, step_distance):
 
     vectors = blob_locs - player_pos
     dists = np.linalg.norm(vectors, axis=1)
-
-    safe_dists = dists.copy()
-    safe_dists[safe_dists < 1.0] = 1.0
-    dirs = vectors / safe_dists.reshape(-1, 1)
-
     edge_dists = dists - player_radius - blob_rads
-    can_eat = player_radius > blob_rads * EAT_RATIO
-    close_enough = edge_dists < player_radius * CHASE_RANGE_MULT
 
-    candidates = can_eat & close_enough
+    can_eat = player_radius > blob_rads * EAT_RATIO
+    in_chase_range = edge_dists < player_radius * CHASE_RANGE_MULT
+    candidates = can_eat & in_chase_range
 
     if not np.any(candidates):
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
         return None
 
-    scores = blob_rads / safe_dists
-    scores[~candidates] = -1.0
+    candidate_indices = np.where(candidates)[0]
 
-    for idx in np.argsort(scores)[::-1]:
-        if scores[idx] <= 0:
-            break
+    # True target locking: briefly prefer the same enemy player if still valid.
+    if CHASE_TARGET_KEY is not None and CHASE_TARGET_TICKS < CHASE_LOCK_TICKS:
+        locked_indices = [
+            idx for idx in candidate_indices
+            if int(blob_player_ids[idx]) == CHASE_TARGET_KEY
+        ]
 
-        chase_dir = dirs[idx]
+        if locked_indices:
+            candidate_indices = np.array(locked_indices, dtype=int)
+
+    best_score = -float("inf")
+    best_idx = None
+    best_direction = None
+    best_closing = 0.0
+    best_near_wall = False
+
+    for idx in candidate_indices:
+        target_key = int(blob_player_ids[idx])
+
+        predicted_pos, enemy_vel = predicted_enemy_position(
+            cache,
+            idx,
+            CHASE_LEAD_TICKS,
+        )
+
+        chase_vec = predicted_pos - player_pos
+        chase_dir = normalize(chase_vec)
+
+        if chase_dir is None:
+            continue
+
         dx, dy = float(chase_dir[0]), float(chase_dir[1])
+
         report = danger_report(cache, dx, dy, step_distance)
 
         if not report["safe"]:
             continue
 
-        return dx, dy, False
+        future_pos = np.array([report["future_x"], report["future_y"]], dtype=float)
 
-    return None
+        # Are we gaining against where the enemy is likely to be?
+        current_dist = np.linalg.norm(blob_locs[idx] - player_pos)
+        future_dist = np.linalg.norm(predicted_pos - future_pos)
+        closing = float(current_dist - future_dist)
+
+        target_near_wall = enemy_near_wall_or_corner(predicted_pos)
+        target_running_wall = enemy_running_toward_wall(blob_locs[idx], enemy_vel)
+
+        # Do not tunnel in open space if we clearly are not gaining.
+        if closing < CHASE_MIN_CLOSING_RATE and not target_near_wall and not target_running_wall:
+            score_penalty = 12.0
+        else:
+            score_penalty = 0.0
+
+        # Reward valuable targets, closer targets, good closing, and wall traps.
+        score = 0.0
+        score += blob_rads[idx] * 4.0
+        score -= max(edge_dists[idx], 0.0) * 0.35
+        score += closing * 8.0
+        score += report["score"] * 0.0002
+        score -= score_penalty
+
+        if target_near_wall:
+            score += 10.0
+
+        if target_running_wall:
+            score += 5.0
+
+        if CHASE_TARGET_KEY == target_key:
+            score += 6.0
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+            best_direction = chase_dir
+            best_closing = closing
+            best_near_wall = target_near_wall or target_running_wall
+
+    if best_direction is None:
+        CHASE_LOST_TICKS += 1
+
+        if CHASE_LOST_TICKS >= CHASE_LOST_LIMIT:
+            CHASE_TARGET_KEY = None
+            CHASE_TARGET_TICKS = 0
+            CHASE_LOST_TICKS = 0
+
+        return None
+
+    # Give up only after repeated non-closing chase attempts in open space.
+    if best_closing < CHASE_MIN_CLOSING_RATE and not best_near_wall:
+        CHASE_LOST_TICKS += 1
+    else:
+        CHASE_LOST_TICKS = 0
+
+    if CHASE_LOST_TICKS >= CHASE_LOST_LIMIT:
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
+        return None
+
+    chosen_key = int(blob_player_ids[best_idx])
+
+    if CHASE_TARGET_KEY == chosen_key:
+        CHASE_TARGET_TICKS += 1
+    else:
+        CHASE_TARGET_KEY = chosen_key
+        CHASE_TARGET_TICKS = 0
+
+    return float(best_direction[0]), float(best_direction[1]), False
 
 
 # =========================
@@ -1176,6 +1423,7 @@ def choose_direction(game: Game):
     global LAST_DIRECTION
 
     cache = build_cache(game)
+    update_enemy_velocity(cache)
     step_distance = STEP_DISTANCE_MULT * cache["player_radius"]
 
     # Strategic priority order:
