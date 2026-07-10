@@ -1,1014 +1,1884 @@
-from __future__ import annotations
-
-import math
-
-import numpy as np
-
 from helper.game import Game
 from lib.interface.events.moves.move_player import MovePlayer
 from lib.interface.queries.query_move import QueryMovePlayer
 from lib.models.penguin_model import DirectionModel
 
-
-TAU = 2.0 * math.pi
-
-# Engine-grounded constants from agario-public-main.
-BASE_PLAYER_SPEED = 1.1
-PLAYER_SPEED_RADIUS_FACTOR = 0.08
-MIN_PLAYER_SPEED = 0.25
-EAT_SIZE_RATIO = 1.2
-MAX_BLOB_COUNT = 16
-SPLIT_MIN_MASS = 2.0
-SPLIT_COOLDOWN_FRAMES = 18
-SPLIT_EJECT_SPEED = 1.6
-SPLIT_EJECT_DRAG = 0.82
-FOOD_RADIUS = 0.15
-
-# Farming / prey scoring.
-FOOD_CLUSTER_RADIUS_MULT = 2.35
-FOOD_CLUSTER_MIN_RADIUS = 1.15
-FOOD_CLUSTER_MAX_RADIUS = 5.5
-FOOD_VALUE_WEIGHT = 7.0
-FOOD_COUNT_WEIGHT = 8.0
-FOOD_DENSITY_WEIGHT = 13.0
-FOOD_DISTANCE_WEIGHT = 0.45
-PREY_VALUE_WEIGHT = 3.0
-PREY_RADIUS_RATIO = 0.82
-
-# Threat / survival scoring.
-THREAT_RADIUS_RATIO = 1.06
-SAFETY_MARGIN = 2.2
-# SPLIT_THREAT_RATIO / SPLIT_REACH_MULT removed: counter-split logic uses COUNTER_SPLIT_* instead.
-
-# Counter-split prediction. This is the main anti-"big blob suddenly splits and eats us" mechanism.
-COUNTER_SPLIT_REACTION_MARGIN = 1.4
-COUNTER_SPLIT_DETECTION_MULT = 1.35
-COUNTER_SPLIT_ESCAPE_WEIGHT = 2.4
-COUNTER_SPLIT_MIN_RADIUS_RATIO = 1.55
-
-SURVIVAL_HEADING_STICKINESS = 1.2
-FARM_HEADING_STICKINESS = 18.0
-VIRUS_ROUTE_TARGET_WEIGHT = 4.0
-VIRUS_ROUTE_HEADING_STICKINESS = 1.8
-SURVIVAL_SMOOTHING = 0.12
-FARMING_SMOOTHING = 0.52
-
-# Split-chase tuning. The engine splits every eligible blob, so we only split
-# while merged / stable, and we use a cooldown longer than the engine cooldown.
-SPLIT_TARGET_VALUE = 230.0
-SPLIT_REACH_RADIUS_MULT = 2.85
-SPLIT_DANGER_LOOKAHEAD = 2.8
-SPLIT_COOLDOWN_ROUNDS = SPLIT_COOLDOWN_FRAMES + 4
-SPLIT_ONLY_WHEN_MERGED = True
-SPLIT_MIN_TARGET_RADIUS = 0.35
-SPLIT_MAX_DISTANCE_PENALTY = 35.0
-
-# Virus handling. Virus consumption is based on blob mass, not player radius.
-VIRUS_BLOB_LOOKAHEAD_MULT = 3.2
-VIRUS_SPLIT_EXTRA_MARGIN = 1.15
-VIRUS_BASE_MARGIN = 0.35
-VIRUS_PATH_MARGIN = 0.2
-
-# Early-game aggressiveness. Higher threat ratio = fewer enemies blocked.
-EARLY_GAME_THRESHOLD = 0.25
-EARLY_THREAT_RATIO = 1.15
-EARLY_FARM_STICKINESS = 7.0
-EARLY_FARMING_SMOOTHING = 0.4  # less smoothing → faster pivots in first 25% of rounds
-
-# Wall avoidance: linear-ramp cone blocks wall-facing angles proportionally to proximity.
-# (Using _danger_cone with a fixed radius clamped to ±90° when dist < radius; this is correct.)
-EDGE_AVOID_MARGIN = 6.0        # wall danger activates within this distance of player centre
-
-# Survival safe-angle selection: bias toward aggregate escape direction.
-FLEE_DIRECTION_WEIGHT = 2.5    # score bonus for angles aligned with aggregate escape direction
-
-# Merge drive: aim toward mass-weighted centroid once blobs can merge.
-MERGE_PULL_WEIGHT = 85.0       # goal score weight for convergence heading
-MERGE_READY_COOLDOWN = 3       # merge_cooldown threshold to count a blob as merge-ready
-
-_LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
-_LAST_SPLIT_ROUND = -9999
+import numpy as np
 
 
-class _Ctx:
-    """Per-turn precomputed state shared across helper functions."""
+# =========================
+# Constants
+# =========================
 
-    __slots__ = (
-        "player_id",
-        "player_pos",
-        "player_radius",
-        "me",
-        "my_blobs",
-        "visible_blobs",
-        "visible_food",
-        "visible_viruses",
-        "food_clusters",
-        "round_index",
-        "round_frac",
-        "arena_size",
+NUM_DIRECTIONS = 16
+DIRECTIONS = np.array([
+    [np.cos(2 * np.pi * i / NUM_DIRECTIONS),
+     np.sin(2 * np.pi * i / NUM_DIRECTIONS)]
+    for i in range(NUM_DIRECTIONS)
+], dtype=float)
+
+# Used only when already split. Chase is disabled then, so 8-way movement is
+# enough and cuts repeated safety scoring roughly in half.
+DIRECTIONS_FAST = DIRECTIONS[::2]
+
+ARENA_SIZE = 60.0
+OFF_MAP_PENALTY = 1_000_000_000.0
+
+# Performance caps
+MAX_FOOD_CONSIDERED = 28
+MAX_BLOBS_CONSIDERED = 22
+MAX_VIRUSES_CONSIDERED = 12
+MAX_OWN_BLOBS_CONSIDERED = 3
+
+
+# Movement
+STEP_DISTANCE_MULT = 1.5
+TURN_WEIGHT = 80.0
+LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
+
+# Food target locking / clustering
+FOOD_REACHED_DIST_MULT = 0.40
+FOOD_REACHED_DIST_MIN = 0.35
+FOOD_TARGET_MAX_TICKS = 10
+FOOD_NO_PROGRESS_LIMIT = 4
+FOOD_BLACKLIST_TICKS = 25
+FOOD_CORNER_MARGIN = 0.45
+FOOD_CLUSTER_RADIUS = 4.0
+FOOD_CLUSTER_WEIGHT = 0.55
+FOOD_DISTANCE_POWER = 1.15
+FOOD_MIN_TARGET_DIST = 0.15
+FOOD_SCORE_WEIGHT = 900.0
+
+# Roam / unstuck
+ROAM_LOCK_TICKS = 6
+ROAM_CENTER_WEIGHT = 350.0
+ROAM_MOVE_WEIGHT = 1000.0
+ROAM_STICKINESS_WEIGHT = 250.0
+WALL_BUFFER = 0.25
+STUCK_TICK_LIMIT = 4
+STUCK_MOVE_EPS_MULT = 0.04
+STUCK_CENTER_WEIGHT = 600.0
+STUCK_MOVE_WEIGHT = 2000.0
+
+# Enemy danger
+DANGER_OVERRIDE_RANGE_MULT = 9.0
+DANGER_DIRECT_RATIO = 1.06
+DANGER_SPLIT_RATIO = 1.08
+DANGER_SPLIT_RANGE_MULT = 5.0
+DANGER_WEIGHT = 120000.0
+DANGER_DISTANCE_POWER = 1.2
+DANGER_HARD_CLOSE_MULT = 2.5
+DANGER_WALL_PUSH_PENALTY = 50000.0
+DANGER_MOVE_REWARD = 5000.0
+
+# Enemy scoring / chasing
+EAT_RATIO = 1.12
+ENEMY_DANGER_WEIGHT = 14000.0
+ENEMY_HUNT_WEIGHT = 2500.0
+CHASE_RANGE_MULT = 7.0
+CHASE_LOCK_TICKS = 14
+CHASE_LOST_LIMIT = 8
+CHASE_LEAD_TICKS = 2.6
+CHASE_MIN_CLOSING_RATE = -1.25
+CHASE_WALL_DIST = 8.0
+CHASE_CLOSE_WEIGHT = 24.0
+CHASE_SIZE_WEIGHT = 5.0
+CHASE_STICKINESS_WEIGHT = 8.0
+CHASE_BLOCK_DIST_WEIGHT = 8.0
+CHASE_CENTER_SIDE_WEIGHT = 42.0
+CHASE_DIRECT_EDGE_MULT = 2.8
+
+# Virus safety / farming
+VIRUS_DANGER_WEIGHT = 12000.0
+VIRUS_PATH_BUFFER_MULT = 0.65
+VIRUS_FARM_EAT_RATIO = 1.10
+VIRUS_FARM_ENEMY_RANGE_MULT = 8.0
+VIRUS_FARM_PIECE_RADIUS_MULT = 0.35
+VIRUS_MEMORY_REACHED_DIST_MULT = 1.4
+VIRUS_MEMORY_KEY_DECIMALS = 1
+VIRUS_LOCK_TICKS = 18
+VIRUS_SWITCH_DIST_MULT = 0.65
+VIRUS_MEMORY_MAX = 30
+VIRUS_MAX_CANDIDATES = 8
+
+# Split kill
+SPLIT_MIN_RADIUS = 1.35
+SPLIT_EAT_RATIO = 1.10
+SPLIT_RANGE_MULT = 2.5
+SPLIT_RANGE_SAFETY_MULT = 0.75
+SPLIT_TARGET_MIN_RADIUS_MULT = 0.16
+SPLIT_VIRUS_BUFFER_MULT = 1.3
+SPLIT_POST_DANGER_RANGE_MULT = 5.5
+SPLIT_HIT_BUFFER = 0.75
+SPLIT_MAX_OWN_BLOBS = 4
+SPLIT_HUGE_RADIUS = 40.0
+SPLIT_HUGE_MAX_OWN_BLOBS = 2
+SPLIT_REACH_MARGIN_MULT = 0.12
+SPLIT_LANDING_DANGER_RATIO = 1.08
+SPLIT_MAX_TARGETS = 7
+SPLIT_MAX_LAUNCHERS = 3
+SPLIT_TOP_EXACT_CHECKS = 2
+SPLIT_PRECHECK_LIMIT = 10
+
+
+
+# =========================
+# Global memory
+# =========================
+
+FOOD_TARGET_KEY = None
+FOOD_TARGET_TICKS = 0
+FOOD_TARGET_NO_PROGRESS = 0
+FOOD_TARGET_LAST_DIST = None
+FOOD_BLACKLIST = {}
+
+ROAM_DIRECTION = None
+ROAM_TICKS = 0
+
+LAST_POSITION = None
+STUCK_TICKS = 0
+
+ENEMY_LAST_POS = {}
+CHASE_TARGET_KEY = None
+CHASE_TARGET_TICKS = 0
+CHASE_LOST_TICKS = 0
+
+VIRUS_MEMORY = {}
+VIRUS_TARGET_KEY = None
+VIRUS_TARGET_TICKS = 0
+
+
+# =========================
+# Basic helpers
+# =========================
+
+def vec_norm(vec):
+    norm = np.linalg.norm(vec)
+    if norm <= 1e-9:
+        return None
+    return vec / norm
+
+
+def clamp_for_radius(x, y, radius):
+    min_pos = radius + WALL_BUFFER
+    max_pos = ARENA_SIZE - radius - WALL_BUFFER
+
+    if min_pos > max_pos:
+        min_pos = radius
+        max_pos = ARENA_SIZE - radius
+
+    return (
+        min(max(float(x), min_pos), max_pos),
+        min(max(float(y), min_pos), max_pos),
     )
 
-    def __init__(
-        self,
-        player_id: int,
-        player_pos: np.ndarray,
-        player_radius: float,
-        me,
-        my_blobs: list,
-        visible_blobs: list,
-        visible_food: list,
-        visible_viruses: list,
-        food_clusters: list,
-        round_index: int,
-        round_frac: float,
-        arena_size: float,
-    ) -> None:
-        self.player_id = player_id
-        self.player_pos = player_pos
-        self.player_radius = player_radius
-        self.me = me
-        self.my_blobs = my_blobs
-        self.visible_blobs = visible_blobs
-        self.visible_food = visible_food
-        self.visible_viruses = visible_viruses
-        self.food_clusters = food_clusters
-        self.round_index = round_index
-        self.round_frac = round_frac
-        self.arena_size = arena_size
+
+def clamp_many_for_radius(points, radii):
+    """Vectorized clamp for many own blobs."""
+    min_pos = radii + WALL_BUFFER
+    max_pos = ARENA_SIZE - radii - WALL_BUFFER
+
+    too_big = min_pos > max_pos
+    if np.any(too_big):
+        min_pos = np.where(too_big, radii, min_pos)
+        max_pos = np.where(too_big, ARENA_SIZE - radii, max_pos)
+
+    out = points.copy()
+    out[:, 0] = np.minimum(np.maximum(out[:, 0], min_pos), max_pos)
+    out[:, 1] = np.minimum(np.maximum(out[:, 1], min_pos), max_pos)
+    return out
 
 
-def _pos(obj) -> np.ndarray:
-    return np.array(obj.pos, dtype=float)
+def clamp_player(cache, x, y):
+    return clamp_for_radius(x, y, cache["player_radius"])
 
 
-def _radius(obj, default: float = 1.0) -> float:
-    return float(getattr(obj, "radius", getattr(obj, "size", default)))
+def cap_nearest(locs, max_items, player_pos, *arrays):
+    if len(locs) <= max_items:
+        return (locs, *arrays)
+
+    dists = np.sum((locs - player_pos) ** 2, axis=1)
+    keep = np.argpartition(dists, max_items - 1)[:max_items]
+
+    result = [locs[keep]]
+    for arr in arrays:
+        result.append(arr[keep])
+
+    return tuple(result)
 
 
-def _mass(obj) -> float:
-    radius = _radius(obj)
-    return radius * radius
+def move_future(cache, dx, dy, step_distance):
+    future_x = cache["player_x"] + dx * step_distance
+    future_y = cache["player_y"] + dy * step_distance
+    return clamp_player(cache, future_x, future_y)
 
 
-def _norm(v: np.ndarray) -> float:
-    return math.hypot(float(v[0]), float(v[1]))
+def move_distance(cache, future_x, future_y):
+    return float(np.linalg.norm(
+        np.array([
+            future_x - cache["player_x"],
+            future_y - cache["player_y"],
+        ], dtype=float)
+    ))
 
 
-def _unit(v: np.ndarray) -> np.ndarray:
-    length = _norm(v)
-    if length == 0:
-        return np.array([1.0, 0.0])
-    return v / length
+def report_to_result(report, split=False):
+    return float(report["dx"]), float(report["dy"]), bool(split)
 
 
-def _my_blobs(player) -> list:
-    blobs = getattr(player, "blobs", {})
-    if isinstance(blobs, dict):
-        return list(blobs.values())
-    return list(blobs or [])
-
-
-def _active_blobs(player) -> list:
-    blobs = _my_blobs(player)
-    return blobs if blobs else [player]
-
-
-def _blob_pos(blob) -> np.ndarray:
-    if hasattr(blob, "pos"):
-        return _pos(blob)
-    return np.array([blob.x, blob.y], dtype=float)
-
-
-def _eligible_split_blobs(player) -> list:
-    return [blob for blob in _my_blobs(player) if _mass(blob) >= SPLIT_MIN_MASS]
-
-
-def _largest_split_blob(player):
-    eligible = _eligible_split_blobs(player)
-    if not eligible:
+def report_towards(cache, target_vec, reports=None, stickiness=True, danger_scale=0.001):
+    target_dir = vec_norm(target_vec)
+    if target_dir is None:
         return None
-    return max(eligible, key=_radius)
 
+    if reports is None:
+        reports = cache["safe_reports"]
 
-def _is_multi_or_unmerged(ctx: _Ctx) -> bool:
-    if len(ctx.my_blobs) > 1:
-        return True
-    return any(int(getattr(blob, "merge_cooldown", 0)) > 0 for blob in ctx.my_blobs)
-
-
-def _movement_speed(radius: float) -> float:
-    return max(MIN_PLAYER_SPEED, BASE_PLAYER_SPEED / (1.0 + radius * PLAYER_SPEED_RADIUS_FACTOR))
-
-
-def _angle_of(v: np.ndarray) -> float:
-    return math.atan2(float(v[1]), float(v[0])) % TAU
-
-
-def _angle_to_vec(angle: float) -> tuple[float, float]:
-    return (math.cos(angle), math.sin(angle))
-
-
-def _angle_diff(a: float, b: float) -> float:
-    return abs((a - b + math.pi) % TAU - math.pi)
-
-
-def _smoothed_direction(raw_direction: np.ndarray, smoothing: float) -> tuple[float, float]:
-    global _LAST_DIRECTION
-
-    raw_direction = _unit(raw_direction)
-    previous = _unit(_LAST_DIRECTION)
-    direction = previous * smoothing + raw_direction * (1.0 - smoothing)
-
-    if _norm(direction) < 1e-6:
-        direction = raw_direction
-
-    _LAST_DIRECTION = _unit(direction)
-    return (float(_LAST_DIRECTION[0]), float(_LAST_DIRECTION[1]))
-
-
-def _edge_distance(
-    a_pos: np.ndarray,
-    a_radius: float,
-    b_pos: np.ndarray,
-    b_radius: float,
-) -> float:
-    return max(0.0, _norm(b_pos - a_pos) - a_radius - b_radius)
-
-
-def _can_eat(eater_radius: float, target_radius: float) -> bool:
-    return eater_radius >= target_radius * EAT_SIZE_RATIO
-
-
-def _can_consume_virus(blob_radius: float, virus_radius: float) -> bool:
-    # Engine uses: blob.mass > virus.radius * EAT_SIZE_RATIO.
-    return blob_radius * blob_radius > virus_radius * EAT_SIZE_RATIO
-
-
-def _blocked_interval(center_angle: float, half_width: float) -> tuple[float, float] | None:
-    if half_width >= math.pi:
-        return (0.0, TAU)
-    return ((center_angle - half_width) % TAU, (center_angle + half_width) % TAU)
-
-
-def _danger_cone(
-    player_pos: np.ndarray,
-    target_pos: np.ndarray,
-    inflated_radius: float,
-) -> tuple[float, float] | None:
-    to_target = target_pos - player_pos
-    distance = _norm(to_target)
-
-    if distance == 0:
-        return (0.0, TAU)
-
-    half_width = math.asin(min(1.0, inflated_radius / distance))
-    return _blocked_interval(_angle_of(to_target), half_width)
-
-
-def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    if not intervals:
-        return []
-
-    expanded: list[tuple[float, float]] = []
-    for start, end in intervals:
-        start %= TAU
-        end %= TAU
-        if start == 0.0 and end == TAU:
-            return [(0.0, TAU)]
-        if start <= end:
-            expanded.append((start, end))
-        else:
-            expanded.append((start, TAU))
-            expanded.append((0.0, end))
-
-    expanded.sort()
-    merged = [expanded[0]]
-    for start, end in expanded[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end:
-            merged[-1] = (last_start, max(last_end, end))
-        else:
-            merged.append((start, end))
-
-    if len(merged) > 1 and merged[0][0] == 0.0 and merged[-1][1] == TAU:
-        first_start, first_end = merged.pop(0)
-        last_start, _ = merged.pop()
-        merged.insert(0, (last_start, first_end))
-
-    return merged
-
-
-def _safe_gaps(blocked: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    blocked = _merge_intervals(blocked)
-    if not blocked:
-        return [(0.0, TAU)]
-    if len(blocked) == 1 and blocked[0] == (0.0, TAU):
-        return []
-
-    gaps: list[tuple[float, float]] = []
-    for i, (_, end) in enumerate(blocked):
-        next_start = blocked[(i + 1) % len(blocked)][0]
-        width = (next_start - end) % TAU
-        if width > 1e-6:
-            gaps.append((end % TAU, width))
-    return gaps
-
-
-def _angle_in_gap(angle: float, gap: tuple[float, float]) -> bool:
-    start, width = gap
-    return ((angle - start) % TAU) <= width
-
-
-def _shift_into_gap(
-    angle: float,
-    gap: tuple[float, float],
-    preferred_angle: float | None = None,
-) -> float:
-    if _angle_in_gap(angle, gap):
-        return angle
-
-    start, width = gap
-    end = (start + width) % TAU
-    dist_to_start = (angle - start) % TAU
-    dist_to_end = (end - angle) % TAU
-
-    if preferred_angle is not None:
-        target_is_ambiguous = abs(dist_to_start - dist_to_end) < 0.75
-        preference_is_safe = _angle_in_gap(preferred_angle, gap)
-        if target_is_ambiguous or preference_is_safe:
-            return start if _angle_diff(start, preferred_angle) < _angle_diff(end, preferred_angle) else end
-
-    # Use true bidirectional angular distance rather than the directed sweep metric.
-    # The old (angle - start) % TAU is a CCW-sweep measure; in corners it picks the
-    # geometrically FAR gap edge (e.g. 225° SW instead of 45° NE) causing wall-hugging.
-    return start if _angle_diff(angle, start) <= _angle_diff(angle, end) else end
-
-
-def _build_food_clusters(visible_food: list, player_radius: float) -> list[dict]:
-    """Cluster nearby food pellets into weighted aggregate targets."""
-    clusters: list[dict] = []
-    merge_distance = min(
-        FOOD_CLUSTER_MAX_RADIUS,
-        max(FOOD_CLUSTER_MIN_RADIUS, player_radius * FOOD_CLUSTER_RADIUS_MULT),
-    )
-
-    for food in visible_food:
-        food_pos = _pos(food)
-        food_value = _radius(food)
-
-        closest_cluster = None
-        closest_distance = float("inf")
-        for cluster in clusters:
-            distance = _norm(food_pos - cluster["pos"])
-            if distance < merge_distance and distance < closest_distance:
-                closest_cluster = cluster
-                closest_distance = distance
-
-        if closest_cluster is None:
-            clusters.append({"pos": food_pos, "value": food_value, "count": 1})
-            continue
-
-        old_value = float(closest_cluster["value"])
-        new_value = old_value + food_value
-        if new_value > 0:
-            closest_cluster["pos"] = (closest_cluster["pos"] * old_value + food_pos * food_value) / new_value
-        else:
-            closest_cluster["pos"] = (closest_cluster["pos"] + food_pos) / 2.0
-        closest_cluster["value"] = new_value
-        closest_cluster["count"] = int(closest_cluster.get("count", 1)) + 1
-
-    return clusters
-
-
-def _food_cluster_score(
-    cluster: dict,
-    player_pos: np.ndarray,
-    angle: float | None = None,
-) -> float:
-    to_food = cluster["pos"] - player_pos
-    distance = max(0.1, _norm(to_food))
-    value = float(cluster["value"])
-    count = int(cluster.get("count", 1))
-
-    # Value/count/density makes a real cloud beat a single slightly-closer pellet.
-    base_score = (
-        value * FOOD_VALUE_WEIGHT
-        + count * FOOD_COUNT_WEIGHT
-        + (value / distance) * FOOD_DENSITY_WEIGHT
-        - distance * FOOD_DISTANCE_WEIGHT
-    )
-
-    if angle is None:
-        return base_score
-
-    alignment = math.cos(_angle_diff(angle, _angle_of(to_food)))
-    return base_score * alignment
-
-
-def _target_score(angle: float, ctx: _Ctx) -> float:
-    score = 0.0
-
-    for cluster in ctx.food_clusters:
-        score += _food_cluster_score(cluster, ctx.player_pos, angle)
-
-    for blob in ctx.visible_blobs:
-        if blob.player_id == ctx.player_id:
-            continue
-        blob_pos = _pos(blob)
-        blob_radius = _radius(blob)
-        if blob_radius < ctx.player_radius * PREY_RADIUS_RATIO:
-            distance = max(0.1, _edge_distance(ctx.player_pos, ctx.player_radius, blob_pos, blob_radius))
-            alignment = math.cos(_angle_diff(angle, _angle_of(blob_pos - ctx.player_pos)))
-            size_value = ctx.player_radius / max(0.1, blob_radius)
-            score += alignment * (PREY_VALUE_WEIGHT * size_value / distance)
-
-    return score
-
-
-def _food_gravity_angle(ctx: _Ctx) -> float | None:
-    """Inverse-distance-squared weighted centroid direction over all visible food pellets.
-
-    Adapted from my_bot.py's food_direction(). Weights every pellet by 1/d², so dense
-    nearby clusters dominate while distant sparse pellets still contribute a gentle pull.
-    This complements cluster scoring: clusters give per-region density context; gravity
-    gives a smooth aggregate gradient that can win when many small clusters tie in score.
-    """
-    if not ctx.visible_food:
-        return None
-    food_locs = np.array([_pos(f) for f in ctx.visible_food], dtype=float)
-    delta = food_locs - ctx.player_pos
-    # sq_dists clamped to ≥1 so nearby pellets don't produce runaway weights.
-    sq_dists = np.maximum(1.0, delta[:, 0] ** 2 + delta[:, 1] ** 2)
-    weights = 1.0 / sq_dists
-    total_w = float(np.sum(weights))
-    if total_w < 1e-9:
-        return None
-    centroid = np.dot(weights, food_locs) / total_w
-    to_centroid = centroid - ctx.player_pos
-    if _norm(to_centroid) < 1e-6:
-        return None
-    return _angle_of(to_centroid)
-
-
-def _segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
-    line = end - start
-    length_sq = float(np.dot(line, line))
-    if length_sq == 0.0:
-        return _norm(point - start)
-    t = max(0.0, min(1.0, float(np.dot(point - start, line) / length_sq)))
-    projection = start + t * line
-    return _norm(point - projection)
-
-
-def _angle_is_safe(angle: float, gaps: list[tuple[float, float]], blocked: list[tuple[float, float]]) -> bool:
-    if not blocked:
-        return True
-    return any(_angle_in_gap(angle, gap) for gap in gaps)
-
-
-def _split_center_travel(child_radius: float) -> float:
-    # Split child starts about 2r ahead, then immediately gets normal movement + eject velocity.
-    return 2.0 * child_radius + SPLIT_EJECT_SPEED + _movement_speed(child_radius)
-
-
-def _split_capture_reach(child_radius: float) -> float:
-    # Target centre only needs to end up inside the child radius. Keep this conservative.
-    return _split_center_travel(child_radius) + child_radius * 0.85
-
-
-def _split_would_hit_bad_virus(
-    ctx: _Ctx,
-    split_blob,
-    child_radius: float,
-    direction: np.ndarray,
-) -> bool:
-    start = _blob_pos(split_blob)
-    end = start + direction * _split_center_travel(child_radius)
-
-    for virus in ctx.visible_viruses:
-        virus_pos = _pos(virus)
-        virus_radius = _radius(virus)
-        if _segment_distance(virus_pos, start, end) > child_radius + virus_radius + VIRUS_PATH_MARGIN:
-            continue
-        if _can_consume_virus(child_radius, virus_radius):
-            return True
-
-    return False
-
-
-def _enemy_split_capture_reach(enemy_child_radius: float) -> float:
-    return _split_center_travel(enemy_child_radius) + enemy_child_radius * 0.85
-
-
-def _counter_split_reach(enemy_radius: float, my_radius: float) -> float:
-    """Centre-distance radius where an enemy split child could land on this blob."""
-    if enemy_radius * enemy_radius < SPLIT_MIN_MASS:
-        return 0.0
-
-    enemy_child_radius = math.sqrt((enemy_radius * enemy_radius) / 2.0)
-    if not _can_eat(enemy_child_radius, my_radius):
-        return 0.0
-
-    return _enemy_split_capture_reach(enemy_child_radius) + my_radius + COUNTER_SPLIT_REACTION_MARGIN
-
-
-def _is_counter_split_threat(enemy_radius: float, my_radius: float, center_distance: float) -> tuple[bool, float]:
-    """Return whether enemy can split-kill us soon and the predicted danger reach."""
-    split_reach = _counter_split_reach(enemy_radius, my_radius)
-    if split_reach <= 0.0:
-        return False, 0.0
-
-    # Ratio check catches obvious split threats early.
-    # Distance check catches close enemies even when ratios are barely over threshold.
-    ratio_threat = enemy_radius >= my_radius * COUNTER_SPLIT_MIN_RADIUS_RATIO
-    distance_threat = center_distance <= split_reach * COUNTER_SPLIT_DETECTION_MULT
-    return ratio_threat or distance_threat, split_reach
-
-
-def _split_would_be_punished(
-    ctx: _Ctx,
-    split_blob,
-    child_radius: float,
-    direction: np.ndarray,
-    target,
-) -> bool:
-    split_pos = _blob_pos(split_blob)
-    child_end = split_pos + direction * _split_center_travel(child_radius)
-
-    for blob in ctx.visible_blobs:
-        if blob.player_id == ctx.player_id:
-            continue
-        if blob is target:
-            continue
-
-        enemy_pos = _pos(blob)
-        enemy_radius = _radius(blob)
-        distance_to_child = _norm(enemy_pos - child_end)
-
-        # Enemy can just eat the post-split child by moving normally.
-        if _can_eat(enemy_radius, child_radius):
-            if distance_to_child <= enemy_radius + _movement_speed(enemy_radius) + SPLIT_DANGER_LOOKAHEAD:
-                return True
-
-        # Enemy can counter-split onto the child.
-        if enemy_radius * enemy_radius >= SPLIT_MIN_MASS:
-            enemy_child_radius = math.sqrt((enemy_radius * enemy_radius) / 2.0)
-            if _can_eat(enemy_child_radius, child_radius):
-                if distance_to_child <= _enemy_split_capture_reach(enemy_child_radius) + SPLIT_DANGER_LOOKAHEAD:
-                    return True
-
-    return False
-
-
-def _best_split_target(
-    ctx: _Ctx,
-    blocked: list[tuple[float, float]],
-    gaps: list[tuple[float, float]],
-) -> tuple[object | None, float | None]:
-    global _LAST_SPLIT_ROUND
-
-    if ctx.round_index - _LAST_SPLIT_ROUND < SPLIT_COOLDOWN_ROUNDS:
-        return None, None
-    if len(ctx.my_blobs) >= MAX_BLOB_COUNT:
-        return None, None
-    if SPLIT_ONLY_WHEN_MERGED and _is_multi_or_unmerged(ctx):
-        return None, None
-
-    # Engine splits every eligible blob in the same direction. If several blobs
-    # are eligible, the risk explodes, so do not split unless we are basically one piece.
-    eligible = _eligible_split_blobs(ctx.me)
-    if len(eligible) != 1:
-        return None, None
-
-    split_blob = _largest_split_blob(ctx.me)
-    if split_blob is None:
-        return None, None
-
-    split_pos = _blob_pos(split_blob)
-    split_radius = _radius(split_blob)
-    child_radius = math.sqrt((split_radius * split_radius) / 2.0)
-    split_reach = _split_capture_reach(child_radius)
-
-    best_target = None
     best_score = -float("inf")
-    best_angle = None
+    best_report = None
 
-    for blob in ctx.visible_blobs:
-        if blob.player_id == ctx.player_id:
-            continue
-
-        target_pos = _pos(blob)
-        target_radius = _radius(blob)
-        center_distance = _norm(target_pos - split_pos)
-        angle = _angle_of(target_pos - split_pos)
-
-        if target_radius < SPLIT_MIN_TARGET_RADIUS:
-            continue
-        if not _can_eat(child_radius, target_radius):
-            continue
-        if center_distance > split_reach:
-            continue
-        if not _angle_is_safe(angle, gaps, blocked):
-            continue
-
-        direction = _unit(target_pos - split_pos)
-        if _split_would_hit_bad_virus(ctx, split_blob, child_radius, direction):
-            continue
-        if _split_would_be_punished(ctx, split_blob, child_radius, direction, blob):
-            continue
-
-        score = (
-            target_radius * target_radius * SPLIT_TARGET_VALUE
-            - center_distance * SPLIT_MAX_DISTANCE_PENALTY
-            + max(0.0, split_reach - center_distance) * 18.0
-        )
-        if score > best_score:
-            best_score = score
-            best_target = blob
-            best_angle = angle
-
-    return best_target, best_angle
-
-
-def _blocked_angles(ctx: _Ctx) -> tuple[list[tuple[float, float]], list[np.ndarray], bool]:
-    blocked: list[tuple[float, float]] = []
-    emergency_away: list[np.ndarray] = []
-    has_threat = False
-
-    threat_ratio = THREAT_RADIUS_RATIO if ctx.round_frac > EARLY_GAME_THRESHOLD else EARLY_THREAT_RATIO
-
-    # Enemy danger is per-owned-blob. After splitting, one child can be in danger
-    # even when the player's mass-weighted centre looks safe.
-    for enemy in ctx.visible_blobs:
-        if enemy.player_id == ctx.player_id:
-            continue
-
-        enemy_pos = _pos(enemy)
-        enemy_radius = _radius(enemy)
-
-        for my_blob in ctx.my_blobs:
-            my_pos = _blob_pos(my_blob)
-            my_radius = _radius(my_blob)
-            to_enemy = enemy_pos - my_pos
-            center_distance = max(0.1, _norm(to_enemy))
-            edge_distance = _edge_distance(my_pos, my_radius, enemy_pos, enemy_radius)
-
-            direct_threat = enemy_radius > my_radius * threat_ratio
-            counter_split_threat, counter_split_reach = _is_counter_split_threat(
-                enemy_radius,
-                my_radius,
-                center_distance,
-            )
-
-            if not direct_threat and not counter_split_threat:
-                continue
-
-            direct_reach = enemy_radius + my_radius + SAFETY_MARGIN
-            reach = direct_reach
-
-            # The old code only widened the enemy cone once the enemy was already
-            # obviously huge. This predicts the split child's landing zone instead,
-            # so we start dodging before the split actually happens.
-            if counter_split_threat:
-                reach = max(reach, counter_split_reach)
-
-            detection_distance = reach + my_radius * 3.5
-            if counter_split_threat:
-                detection_distance = max(
-                    detection_distance,
-                    counter_split_reach * COUNTER_SPLIT_DETECTION_MULT,
-                )
-
-            if center_distance <= detection_distance or edge_distance <= detection_distance:
-                interval = _danger_cone(my_pos, enemy_pos, reach)
-                if interval is not None:
-                    blocked.append(interval)
-                    has_threat = True
-
-                escape_weight = reach / max(0.1, edge_distance)
-                if counter_split_threat:
-                    escape_weight *= COUNTER_SPLIT_ESCAPE_WEIGHT
-
-                emergency_away.append(-_unit(to_enemy) * escape_weight)
-
-    split_or_unmerged = _is_multi_or_unmerged(ctx)
-
-    # Virus danger is also per-owned-blob and uses the engine's mass check.
-    for virus in ctx.visible_viruses:
-        virus_pos = _pos(virus)
-        virus_radius = _radius(virus)
-
-        for my_blob in ctx.my_blobs:
-            blob_pos = _blob_pos(my_blob)
-            blob_radius = _radius(my_blob)
-            if not _can_consume_virus(blob_radius, virus_radius):
-                continue
-
-            edge_distance = _edge_distance(blob_pos, blob_radius, virus_pos, virus_radius)
-            extra_margin = VIRUS_BASE_MARGIN
-            if split_or_unmerged:
-                extra_margin += blob_radius * VIRUS_SPLIT_EXTRA_MARGIN
-
-            close_enough = edge_distance <= blob_radius * VIRUS_BLOB_LOOKAHEAD_MULT + extra_margin
-            if not close_enough:
-                continue
-
-            reach = virus_radius + blob_radius + extra_margin
-            interval = _danger_cone(blob_pos, virus_pos, reach)
-            if interval is not None:
-                blocked.append(interval)
-
-    # Wall avoidance: block angles toward nearby walls using a linear-ramp cone.
-    # half_angle = π/2 × (1 − dist/MARGIN): wide near wall, zero at the margin boundary.
-    if ctx.arena_size > 0:
-        S = ctx.arena_size
-        px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
-        for dist_to_wall, wall_angle in (
-            (px,      math.pi),
-            (S - px,  0.0),
-            (py,      3.0 * math.pi / 2),
-            (S - py,  math.pi / 2),
-        ):
-            if 0 < dist_to_wall < EDGE_AVOID_MARGIN:
-                half_angle = (math.pi / 2) * (1.0 - dist_to_wall / EDGE_AVOID_MARGIN)
-                if half_angle > 0.02:
-                    interval = _blocked_interval(wall_angle, half_angle)
-                    if interval is not None:
-                        blocked.append(interval)
-                escape_angle = (wall_angle + math.pi) % TAU
-                emergency_away.append(
-                    np.array([math.cos(escape_angle), math.sin(escape_angle)])
-                    * (EDGE_AVOID_MARGIN / max(1.0, dist_to_wall))
-                )
-
-    return blocked, emergency_away, has_threat
-
-
-def _best_safe_angle(
-    ctx: _Ctx,
-    gaps: list[tuple[float, float]],
-    previous_angle: float,
-    emergency_away: list[np.ndarray],
-) -> float:
-    best_angle = gaps[0][0] + gaps[0][1] / 2.0
-    best_score = -float("inf")
-
-    # Pre-compute aggregate flee direction and food gravity for candidate generation.
-    flee_angle: float | None = None
-    if emergency_away:
-        flee_sum = np.sum(emergency_away, axis=0)
-        flee_len = _norm(flee_sum)
-        if flee_len > 1e-6:
-            flee_angle = _angle_of(flee_sum / flee_len)
-    gravity_angle = _food_gravity_angle(ctx)  # 1/d²-weighted food centroid direction
-
-    candidate_angles: list[float] = []
-    for gap in gaps:
-        candidate_angles.append((gap[0] + gap[1] / 2.0) % TAU)
-        candidate_angles.append(_shift_into_gap(previous_angle, gap, previous_angle))
-
-        # Explicit escape direction: ensures we consider fleeing even with no food nearby.
-        if flee_angle is not None:
-            candidate_angles.append(_shift_into_gap(flee_angle, gap, flee_angle))
-
-        # Gravity food direction: smooth pull toward densest nearby food region.
-        if gravity_angle is not None:
-            candidate_angles.append(_shift_into_gap(gravity_angle, gap, previous_angle))
-
-        for cluster in ctx.food_clusters:
-            candidate_angles.append(
-                _shift_into_gap(_angle_of(cluster["pos"] - ctx.player_pos), gap, previous_angle)
-            )
-
-        for blob in ctx.visible_blobs:
-            if blob.player_id == ctx.player_id:
-                continue
-            if _radius(blob) < ctx.player_radius * PREY_RADIUS_RATIO:
-                candidate_angles.append(
-                    _shift_into_gap(_angle_of(_pos(blob) - ctx.player_pos), gap, previous_angle)
-                )
-
-    for angle in candidate_angles:
-        containing_gaps = [gap for gap in gaps if _angle_in_gap(angle, gap)]
-        if not containing_gaps:
-            continue
-
-        gap = max(containing_gaps, key=lambda item: item[1])
-        centeredness = math.cos(_angle_diff(angle, (gap[0] + gap[1] / 2.0) % TAU))
-        heading_stickiness = SURVIVAL_HEADING_STICKINESS * math.cos(_angle_diff(angle, previous_angle))
-        flee_score = (
-            FLEE_DIRECTION_WEIGHT * math.cos(_angle_diff(angle, flee_angle))
-            if flee_angle is not None else 0.0
-        )
-        score = gap[1] * 2.0 + centeredness + heading_stickiness + flee_score + _target_score(angle, ctx)
+    for report in reports:
+        direction = report["dir"]
+        score = 1000.0 * np.dot(direction, target_dir)
+        score += danger_scale * report["score"]
+        if stickiness:
+            score += TURN_WEIGHT * np.dot(direction, LAST_DIRECTION)
 
         if score > best_score:
             best_score = score
-            best_angle = angle
+            best_report = report
 
-    return best_angle % TAU
-
-
-def _best_goal_angle(ctx: _Ctx, previous_angle: float) -> tuple[float, bool]:
-    best_angle = previous_angle
-    best_score = -float("inf")
-    farm_stickiness = FARM_HEADING_STICKINESS if ctx.round_frac > EARLY_GAME_THRESHOLD else EARLY_FARM_STICKINESS
-
-    for cluster in ctx.food_clusters:
-        to_cluster = cluster["pos"] - ctx.player_pos
-        angle = _angle_of(to_cluster)
-        heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
-        score = _food_cluster_score(cluster, ctx.player_pos) + heading_stickiness
-        if score > best_score:
-            best_score = score
-            best_angle = angle
-
-    # Food gravity: 1/d²-weighted centroid of all visible pellets (adapted from my_bot.py).
-    # Wins when many small clusters tie in value — the aggregate pull breaks the tie toward
-    # the region with the most pellets overall, not just the single richest cluster.
-    gravity_angle = _food_gravity_angle(ctx)
-    if gravity_angle is not None:
-        heading_stickiness = farm_stickiness * math.cos(_angle_diff(gravity_angle, previous_angle))
-        score = _target_score(gravity_angle, ctx) + heading_stickiness
-        if score > best_score:
-            best_score = score
-            best_angle = gravity_angle
-
-    for blob in ctx.visible_blobs:
-        if blob.player_id == ctx.player_id:
-            continue
-
-        blob_radius = _radius(blob)
-        if blob_radius < ctx.player_radius * PREY_RADIUS_RATIO:
-            blob_pos = _pos(blob)
-            to_blob = blob_pos - ctx.player_pos
-            distance = max(0.1, _edge_distance(ctx.player_pos, ctx.player_radius, blob_pos, blob_radius))
-            angle = _angle_of(to_blob)
-            heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
-            score = (
-                (ctx.player_radius / max(0.1, blob_radius)) * PREY_VALUE_WEIGHT * 80.0
-                - distance
-                + heading_stickiness
-            )
-            if score > best_score:
-                best_score = score
-                best_angle = angle
-
-    # Merge drive: converge split blobs toward mass-weighted centroid once merge cooldown expires.
-    if len(ctx.my_blobs) > 1:
-        ready = [b for b in ctx.my_blobs if int(getattr(b, "merge_cooldown", 999)) <= MERGE_READY_COOLDOWN]
-        if len(ready) >= 2:
-            total_m = sum(_radius(b) ** 2 for b in ctx.my_blobs)
-            if total_m > 0:
-                cx = sum(_blob_pos(b)[0] * _radius(b) ** 2 for b in ctx.my_blobs) / total_m
-                cy = sum(_blob_pos(b)[1] * _radius(b) ** 2 for b in ctx.my_blobs) / total_m
-                to_centroid = np.array([cx, cy]) - ctx.player_pos
-                dist_centroid = _norm(to_centroid)
-                if dist_centroid > ctx.player_radius * 0.5:
-                    angle = _angle_of(to_centroid)
-                    heading_stickiness = farm_stickiness * math.cos(_angle_diff(angle, previous_angle))
-                    score = MERGE_PULL_WEIGHT + heading_stickiness
-                    if score > best_score:
-                        best_score = score
-                        best_angle = angle
-
-    return best_angle, best_score != -float("inf")
+    return best_report
 
 
-def _best_routed_goal_angle(
-    ctx: _Ctx,
-    gaps: list[tuple[float, float]],
-    goal_angle: float,
-    previous_angle: float,
-) -> float:
-    best_angle = previous_angle
-    best_score = -float("inf")
+def report_for_direction(cache, direction):
+    if direction is None:
+        return None
 
-    for gap in gaps:
-        center = (gap[0] + gap[1] / 2.0) % TAU
-        candidates = [
-            _shift_into_gap(goal_angle, gap, previous_angle),
-            _shift_into_gap(previous_angle, gap, previous_angle),
-            center,
-        ]
+    best_dot = -float("inf")
+    best_report = None
 
-        for angle in candidates:
-            target_alignment = math.cos(_angle_diff(angle, goal_angle))
-            heading_stickiness = math.cos(_angle_diff(angle, previous_angle))
-            centeredness = math.cos(_angle_diff(angle, center))
-            score = (
-                VIRUS_ROUTE_TARGET_WEIGHT * target_alignment
-                + VIRUS_ROUTE_HEADING_STICKINESS * heading_stickiness
-                + 0.25 * centeredness
-                + _target_score(angle, ctx)
-            )
+    for report in cache["move_reports"]:
+        dot = float(np.dot(report["dir"], direction))
+        if dot > best_dot:
+            best_dot = dot
+            best_report = report
 
-            if score > best_score:
-                best_score = score
-                best_angle = angle
-
-    return best_angle % TAU
+    return best_report
 
 
-def choose_direction(game: Game) -> tuple[float, float, bool]:
-    global _LAST_SPLIT_ROUND
+def exact_move_safe(cache, direction, step_distance, check_virus=True, enemy_only=False):
+    """Score one exact direction when 16-way snapping is too coarse."""
+    if direction is None:
+        return False
 
+    dx, dy = float(direction[0]), float(direction[1])
+
+    if enemy_only:
+        enemy = score_enemy_threat(cache, dx, dy, step_distance)
+        return enemy["safe"]
+
+    report = score_move(cache, dx, dy, step_distance, check_virus=check_virus)
+    return report["safe"] and report["actual_move"] >= step_distance * 0.18
+
+
+# =========================
+# Raw cache
+# =========================
+
+def cache_raw(game):
     me = game.state.me
-    previous_angle = _angle_of(_LAST_DIRECTION)
 
-    cur_round = int(getattr(game.state, "round", 0) or 0)
-    max_rounds = int(getattr(game.state, "max_rounds", 1) or 1)
-    round_frac = cur_round / max(1, max_rounds)
-    arena_size = 60.0
-    try:
-        arena_size = float(game.state.map.size or 60.0)
-    except (AttributeError, TypeError, ValueError):
-        pass
-    farming_smoothing = FARMING_SMOOTHING if round_frac > EARLY_GAME_THRESHOLD else EARLY_FARMING_SMOOTHING
-
-    visible_blobs = list(game.state.visible_blobs or [])
-    visible_food = list(game.state.visible_food or [])
-    visible_viruses = list(game.state.visible_viruses or [])
     player_pos = np.array([me.x, me.y], dtype=float)
-    player_radius = _radius(me)
-    my_blobs = _active_blobs(me)
+    player_radius = float(me.radius)
+    player_id = me.player_id
 
-    ctx = _Ctx(
-        player_id=me.player_id,
-        player_pos=player_pos,
-        player_radius=player_radius,
-        me=me,
-        my_blobs=my_blobs,
-        visible_blobs=visible_blobs,
-        visible_food=visible_food,
-        visible_viruses=visible_viruses,
-        food_clusters=_build_food_clusters(visible_food, player_radius),
-        round_index=cur_round,
-        round_frac=round_frac,
-        arena_size=arena_size,
+    own_blobs = list(me.blobs.values())
+    if own_blobs:
+        own_locs_all = np.array([blob.pos for blob in own_blobs], dtype=float)
+        own_rads_all = np.array([blob.radius for blob in own_blobs], dtype=float)
+    else:
+        own_locs_all = np.array([[me.x, me.y]], dtype=float)
+        own_rads_all = np.array([me.radius], dtype=float)
+
+    own_blob_count = len(own_rads_all)
+
+    # Safety calculations are the main timeout risk when we are heavily split.
+    # Keep the true blob count for decision logic, but only score the largest
+    # pieces for repeated movement-safety reports.
+    if own_blob_count > MAX_OWN_BLOBS_CONSIDERED:
+        keep = np.argsort(own_rads_all)[-MAX_OWN_BLOBS_CONSIDERED:]
+        own_locs = own_locs_all[keep]
+        own_rads = own_rads_all[keep]
+    else:
+        own_locs = own_locs_all
+        own_rads = own_rads_all
+
+    foods = game.state.visible_food
+    if foods:
+        food_locs = np.array([food.pos for food in foods], dtype=float)
+        if len(food_locs) > MAX_FOOD_CONSIDERED:
+            food_locs, = cap_nearest(food_locs, MAX_FOOD_CONSIDERED, player_pos)
+    else:
+        food_locs = np.empty((0, 2), dtype=float)
+
+    visible_blobs = game.state.visible_blobs
+    enemy_blobs = [
+        blob for blob in visible_blobs
+        if getattr(blob, "player_id", None) != player_id
+    ]
+
+    if enemy_blobs:
+        blob_locs = np.array([blob.pos for blob in enemy_blobs], dtype=float)
+        blob_rads = np.array([blob.radius for blob in enemy_blobs], dtype=float)
+        blob_player_ids = np.array([blob.player_id for blob in enemy_blobs], dtype=int)
+
+        if len(blob_locs) > MAX_BLOBS_CONSIDERED:
+            blob_locs, blob_rads, blob_player_ids = cap_nearest(
+                blob_locs,
+                MAX_BLOBS_CONSIDERED,
+                player_pos,
+                blob_rads,
+                blob_player_ids,
+            )
+
+        merged_rads = np.zeros(len(blob_rads), dtype=float)
+        for pid in np.unique(blob_player_ids):
+            same_player = blob_player_ids == pid
+            total_mass = np.sum(blob_rads[same_player] ** 2)
+            merged_rads[same_player] = np.sqrt(total_mass)
+    else:
+        blob_locs = np.empty((0, 2), dtype=float)
+        blob_rads = np.empty(0, dtype=float)
+        blob_player_ids = np.empty(0, dtype=int)
+        merged_rads = np.empty(0, dtype=float)
+
+    viruses = game.state.visible_viruses
+    if viruses:
+        virus_locs = np.array([virus.pos for virus in viruses], dtype=float)
+        virus_rads = np.array([virus.radius for virus in viruses], dtype=float)
+        if len(virus_locs) > MAX_VIRUSES_CONSIDERED:
+            virus_locs, virus_rads = cap_nearest(
+                virus_locs,
+                MAX_VIRUSES_CONSIDERED,
+                player_pos,
+                virus_rads,
+            )
+    else:
+        virus_locs = np.empty((0, 2), dtype=float)
+        virus_rads = np.empty(0, dtype=float)
+
+    return {
+        "player_pos": player_pos,
+        "player_x": float(player_pos[0]),
+        "player_y": float(player_pos[1]),
+        "player_radius": player_radius,
+        "player_id": player_id,
+
+        "own_locs": own_locs,
+        "own_rads": own_rads,
+        "own_blob_count": own_blob_count,
+
+        "food_locs": food_locs,
+
+        "blob_locs": blob_locs,
+        "blob_rads": blob_rads,
+        "blob_player_ids": blob_player_ids,
+        "merged_rads": merged_rads,
+
+        "virus_locs": virus_locs,
+        "virus_rads": virus_rads,
+    }
+
+
+# =========================
+# Score functions
+# =========================
+
+def score_virus_segment(cache, start_pos, end_pos, radius, buffer_mult):
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if len(virus_locs) == 0:
+        return 0.0
+
+    dangerous = radius > virus_rads * 1.1
+    if not np.any(dangerous):
+        return 0.0
+
+    segment = end_pos - start_pos
+    segment_len_sq = np.dot(segment, segment)
+
+    if segment_len_sq <= 1e-9:
+        dists = np.linalg.norm(virus_locs - start_pos, axis=1)
+    else:
+        to_viruses = virus_locs - start_pos
+        t = np.sum(to_viruses * segment, axis=1) / segment_len_sq
+        t = np.clip(t, 0.0, 1.0)
+        closest_points = start_pos + t.reshape(-1, 1) * segment
+        dists = np.linalg.norm(virus_locs - closest_points, axis=1)
+
+    clearances = dists - radius - virus_rads
+
+    if np.any(dangerous & (clearances < radius * buffer_mult)):
+        return -OFF_MAP_PENALTY
+
+    clearances[clearances < 1.0] = 1.0
+    return -float(np.sum(VIRUS_DANGER_WEIGHT / (clearances[dangerous] ** 3)))
+
+
+def score_own_blob_virus(cache, dx, dy, step_distance):
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if len(own_locs) == 0 or len(virus_locs) == 0:
+        return 0.0
+
+    dangerous = own_rads[:, None] > virus_rads[None, :] * 1.1
+    if not np.any(dangerous):
+        return 0.0
+
+    starts = own_locs
+    ends = own_locs + np.array([dx * step_distance, dy * step_distance], dtype=float)
+    ends = clamp_many_for_radius(ends, own_rads)
+
+    segments = ends - starts
+    seg_len_sq = np.sum(segments * segments, axis=1)
+
+    to_viruses = virus_locs[None, :, :] - starts[:, None, :]
+
+    # Projection of each virus onto each own-blob movement segment.
+    denom = np.where(seg_len_sq <= 1e-9, 1.0, seg_len_sq)
+    t = np.sum(to_viruses * segments[:, None, :], axis=2) / denom[:, None]
+    t = np.clip(t, 0.0, 1.0)
+    t[seg_len_sq <= 1e-9, :] = 0.0
+
+    closest = starts[:, None, :] + t[:, :, None] * segments[:, None, :]
+    dists = np.linalg.norm(virus_locs[None, :, :] - closest, axis=2)
+    clearances = dists - own_rads[:, None] - virus_rads[None, :]
+
+    if np.any(dangerous & (clearances < own_rads[:, None] * VIRUS_PATH_BUFFER_MULT)):
+        return -OFF_MAP_PENALTY
+
+    safe_clearances = np.maximum(clearances, 1.0)
+    scores = VIRUS_DANGER_WEIGHT / (safe_clearances ** 3)
+    return -float(np.sum(scores[dangerous]))
+
+def score_enemy_threat(cache, dx=0.0, dy=0.0, step_distance=0.0):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+
+    if len(blob_locs) == 0:
+        return {"active": False, "safe": True, "score": 0.0}
+
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+
+    if len(own_locs) == 0:
+        return {"active": False, "safe": True, "score": 0.0}
+
+    player_radius = cache["player_radius"]
+    danger_size = cache.get("enemy_danger_size")
+    if danger_size is None or len(danger_size) != len(blob_rads):
+        danger_size = np.maximum(blob_rads, cache["merged_rads"])
+
+    enemy_split_rads = cache.get("enemy_split_rads")
+    if enemy_split_rads is None or len(enemy_split_rads) != len(blob_rads):
+        enemy_split_rads = blob_rads / np.sqrt(2.0)
+
+    futures = own_locs + np.array([dx * step_distance, dy * step_distance], dtype=float)
+    futures = clamp_many_for_radius(futures, own_rads)
+
+    dists = np.linalg.norm(blob_locs[None, :, :] - futures[:, None, :], axis=2)
+    edge_dists = dists - own_rads[:, None] - blob_rads[None, :]
+
+    direct_danger = danger_size[None, :] > own_rads[:, None] * DANGER_DIRECT_RATIO
+    direct_active = direct_danger & (edge_dists < player_radius * DANGER_OVERRIDE_RANGE_MULT)
+    direct_unsafe = direct_danger & (edge_dists < own_rads[:, None] * DANGER_HARD_CLOSE_MULT)
+
+    split_danger = enemy_split_rads[None, :] > own_rads[:, None] * DANGER_SPLIT_RATIO
+    split_near = edge_dists < blob_rads[None, :] * DANGER_SPLIT_RANGE_MULT
+    split_active = split_danger & split_near
+
+    active = bool(np.any(direct_active | split_active))
+    unsafe = bool(np.any(direct_unsafe | split_active))
+
+    score_dists = np.maximum(edge_dists, 1.0)
+    scored = direct_danger | split_active
+    danger_scores = (
+        DANGER_WEIGHT
+        * (danger_size[None, :] / own_rads[:, None])
+        / (score_dists ** DANGER_DISTANCE_POWER)
     )
 
-    blocked, emergency_away, has_threat = _blocked_angles(ctx)
-    gaps = _safe_gaps(blocked)
+    return {
+        "active": active,
+        "safe": not unsafe,
+        "score": -float(np.sum(danger_scores[scored])),
+    }
 
-    if has_threat:
-        if gaps:
-            angle = _best_safe_angle(ctx, gaps, previous_angle, emergency_away)
-            dx, dy = _smoothed_direction(np.array(_angle_to_vec(angle)), SURVIVAL_SMOOTHING)
-            return dx, dy, False
+def score_move(cache, dx, dy, step_distance, check_virus=True):
+    enemy = score_enemy_threat(cache, dx, dy, step_distance)
+    virus_score = score_own_blob_virus(cache, dx, dy, step_distance) if check_virus else 0.0
+    virus_safe = virus_score > -OFF_MAP_PENALTY / 2
 
-        escape = np.sum(emergency_away, axis=0) if emergency_away else np.array([1.0, 0.0])
-        dx, dy = _smoothed_direction(escape, SURVIVAL_SMOOTHING)
-        return dx, dy, False
+    future_x, future_y = move_future(cache, dx, dy, step_distance)
+    actual_move = move_distance(cache, future_x, future_y)
 
-    split_target, split_angle = _best_split_target(ctx, blocked, gaps)
-    if split_target is not None and split_angle is not None:
-        _LAST_SPLIT_ROUND = cur_round
-        dx, dy = _smoothed_direction(np.array(_angle_to_vec(split_angle)), 0.0)
-        return dx, dy, True
+    return {
+        "enemy_active": enemy["active"],
+        "enemy_safe": enemy["safe"],
+        "virus_safe": bool(virus_safe),
+        "safe": bool(enemy["safe"] and virus_safe),
+        "score": float(enemy["score"] + virus_score),
+        "enemy_score": float(enemy["score"]),
+        "virus_score": float(virus_score),
+        "actual_move": float(actual_move),
+        "future_x": float(future_x),
+        "future_y": float(future_y),
+    }
 
-    best_angle, found_goal = _best_goal_angle(ctx, previous_angle)
-    if not found_goal:
-        dx, dy = _smoothed_direction(np.array([1.0, 0.0]), farming_smoothing)
-        return dx, dy, False
 
-    if blocked and gaps:
-        # When near walls (no enemies), blend goal with wall-escape direction before routing.
-        # Without blending: food behind a wall causes _best_routed_goal_angle to hug the
-        # nearest gap edge in the food direction, which follows the wall into the next corner.
-        # With blending: effective_goal rotates toward open space, routing escapes correctly.
-        effective_goal = best_angle
-        if not has_threat and emergency_away:
-            flee_sum = np.sum(emergency_away, axis=0)
-            flee_len = float(_norm(flee_sum))
-            if flee_len > 0.1:
-                w = min(0.75, flee_len / (flee_len + 2.0))
-                flee_dir = flee_sum / flee_len
-                goal_dir = np.array(_angle_to_vec(best_angle))
-                blended = goal_dir * (1.0 - w) + flee_dir * w
-                if _norm(blended) > 1e-6:
-                    effective_goal = _angle_of(blended)
-        best_angle = _best_routed_goal_angle(ctx, gaps, effective_goal, previous_angle)
+def score_food_position(cache, x, y):
+    food_locs = cache["food_locs"]
+    if len(food_locs) == 0:
+        return 0.0
 
-    dx, dy = _smoothed_direction(np.array(_angle_to_vec(best_angle)), farming_smoothing)
-    return dx, dy, False
+    pos = np.array([x, y], dtype=float)
+    dists = np.linalg.norm(food_locs - pos, axis=1)
+    dists[dists < 1.0] = 1.0
+    return float(np.sum(FOOD_SCORE_WEIGHT / (dists ** 2)))
 
+
+def score_enemy_position(cache, x, y):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
+
+    if len(blob_locs) == 0:
+        return 0.0
+
+    pos = np.array([x, y], dtype=float)
+    player_radius = cache["player_radius"]
+
+    dists = np.linalg.norm(blob_locs - pos, axis=1)
+    edge_dists = dists - player_radius - blob_rads
+    edge_dists[edge_dists < 1.0] = 1.0
+
+    danger_size = np.maximum(blob_rads, merged_rads)
+    dangerous = danger_size > player_radius * 1.08
+    edible = player_radius > blob_rads * EAT_RATIO
+
+    danger_scores = (
+        ENEMY_DANGER_WEIGHT
+        * (danger_size / player_radius)
+        / (edge_dists ** 1.3)
+    )
+    hunt_scores = (
+        ENEMY_HUNT_WEIGHT
+        * (player_radius / blob_rads)
+        / (edge_dists ** 2)
+    )
+
+    score = -np.sum(danger_scores[dangerous])
+    if cache["own_blob_count"] == 1:
+        score += np.sum(hunt_scores[edible])
+
+    return float(score)
+
+
+# =========================
+# Derived cache functions
+# =========================
+
+def cache_enemy_velocity(cache):
+    """Estimate per-enemy velocity by matching blobs from the same player."""
+    global ENEMY_LAST_POS
+
+    blob_locs = cache["blob_locs"]
+    blob_player_ids = cache["blob_player_ids"]
+    blob_vels = np.zeros_like(blob_locs, dtype=float)
+
+    if len(blob_locs) == 0:
+        ENEMY_LAST_POS = {}
+        cache["blob_vels"] = blob_vels
+        return
+
+    previous_by_pid = {}
+    for key, pos in ENEMY_LAST_POS.items():
+        previous_by_pid.setdefault(key[0], []).append((key, pos))
+
+    new_last = {}
+
+    for pid in np.unique(blob_player_ids):
+        indices = np.where(blob_player_ids == pid)[0]
+        previous = previous_by_pid.get(int(pid), [])
+        used_previous = set()
+
+        for local_num, idx in enumerate(indices):
+            pos = blob_locs[idx].copy()
+            best_key = None
+            best_pos = None
+            best_dist = float("inf")
+
+            for prev_key, prev_pos in previous:
+                if prev_key in used_previous:
+                    continue
+
+                dist = float(np.sum((pos - prev_pos) ** 2))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_key = prev_key
+                    best_pos = prev_pos
+
+            if best_pos is None:
+                vel = np.array([0.0, 0.0], dtype=float)
+            else:
+                vel = pos - best_pos
+                used_previous.add(best_key)
+
+            speed = np.linalg.norm(vel)
+            max_speed = cache["player_radius"] * 2.5
+            if speed > max_speed and speed > 1e-9:
+                vel = vel / speed * max_speed
+
+            blob_vels[idx] = vel
+            new_last[(int(pid), int(local_num))] = pos
+
+    ENEMY_LAST_POS = new_last
+    cache["blob_vels"] = blob_vels
+
+
+def cache_enemy(cache):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+
+    if len(blob_locs) == 0:
+        cache["enemy_vectors"] = np.empty((0, 2), dtype=float)
+        cache["enemy_dists"] = np.empty(0, dtype=float)
+        cache["enemy_edge_dists"] = np.empty(0, dtype=float)
+        cache["enemy_dirs"] = np.empty((0, 2), dtype=float)
+        cache["enemy_edible"] = np.empty(0, dtype=bool)
+        cache["enemy_pred_locs"] = np.empty((0, 2), dtype=float)
+        cache["enemy_danger_size"] = np.empty(0, dtype=float)
+        cache["enemy_split_rads"] = np.empty(0, dtype=float)
+        return
+
+    vectors = blob_locs - player_pos
+    dists = np.linalg.norm(vectors, axis=1)
+    safe_dists = dists.copy()
+    safe_dists[safe_dists < 1.0] = 1.0
+
+    blob_vels = cache.get("blob_vels")
+    if blob_vels is None or len(blob_vels) != len(blob_locs):
+        blob_vels = np.zeros_like(blob_locs, dtype=float)
+
+    pred_locs = blob_locs + blob_vels * CHASE_LEAD_TICKS
+    pred_locs[:, 0] = np.clip(pred_locs[:, 0], 0.0, ARENA_SIZE)
+    pred_locs[:, 1] = np.clip(pred_locs[:, 1], 0.0, ARENA_SIZE)
+
+    danger_size = np.maximum(blob_rads, cache["merged_rads"])
+
+    cache["enemy_vectors"] = vectors
+    cache["enemy_dists"] = dists
+    cache["enemy_edge_dists"] = dists - player_radius - blob_rads
+    cache["enemy_dirs"] = vectors / safe_dists.reshape(-1, 1)
+    cache["enemy_edible"] = player_radius > blob_rads * EAT_RATIO
+    cache["enemy_pred_locs"] = pred_locs
+    cache["enemy_danger_size"] = danger_size
+    cache["enemy_split_rads"] = blob_rads / np.sqrt(2.0)
+
+
+def cache_food(cache):
+    food_locs = cache["food_locs"]
+    player_pos = cache["player_pos"]
+
+    if len(food_locs) == 0:
+        cache["food_dists"] = np.empty(0, dtype=float)
+        cache["food_dirs"] = np.empty((0, 2), dtype=float)
+        cache["food_scores"] = np.empty(0, dtype=float)
+        return
+
+    vectors = food_locs - player_pos
+    dists = np.linalg.norm(vectors, axis=1)
+    safe_dists = dists.copy()
+    safe_dists[safe_dists < 1.0] = 1.0
+
+    pairwise = np.linalg.norm(
+        food_locs[:, None, :] - food_locs[None, :, :],
+        axis=2,
+    )
+    cluster_density = np.exp(-((pairwise / FOOD_CLUSTER_RADIUS) ** 2)).sum(axis=1) - 1.0
+
+    scores = (
+        (1.0 + FOOD_CLUSTER_WEIGHT * cluster_density)
+        / (safe_dists ** FOOD_DISTANCE_POWER)
+    )
+
+    cache["food_dists"] = dists
+    cache["food_dirs"] = vectors / safe_dists.reshape(-1, 1)
+    cache["food_scores"] = scores
+
+
+def virus_key(pos):
+    return (
+        round(float(pos[0]), VIRUS_MEMORY_KEY_DECIMALS),
+        round(float(pos[1]), VIRUS_MEMORY_KEY_DECIMALS),
+    )
+
+
+def cache_virus_memory(cache):
+    global VIRUS_MEMORY
+
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+    visible_keys = set()
+
+    for pos, rad in zip(cache["virus_locs"], cache["virus_rads"]):
+        key = virus_key(pos)
+        visible_keys.add(key)
+        VIRUS_MEMORY[key] = {
+            "pos": np.array(pos, dtype=float),
+            "radius": float(rad),
+        }
+
+    reached_dist = max(1.0, player_radius * VIRUS_MEMORY_REACHED_DIST_MULT)
+    expired = []
+
+    for key, info in VIRUS_MEMORY.items():
+        if key in visible_keys:
+            continue
+        if np.linalg.norm(info["pos"] - player_pos) < reached_dist:
+            expired.append(key)
+
+    for key in expired:
+        del VIRUS_MEMORY[key]
+
+    # Long games can remember too many old viruses. Keep closest remembered
+    # viruses only; far-away memory should not cost time every tick.
+    if len(VIRUS_MEMORY) > VIRUS_MEMORY_MAX:
+        ordered = sorted(
+            VIRUS_MEMORY.items(),
+            key=lambda item: float(np.sum((item[1]["pos"] - player_pos) ** 2)),
+        )
+        VIRUS_MEMORY = dict(ordered[:VIRUS_MEMORY_MAX])
+
+
+def cache_move_reports(cache, step_distance):
+    """Score all movement directions in one vectorized batch.
+
+    This preserves the calculations performed by score_move(), but avoids
+    rebuilding and allocating the same own/enemy/virus arrays 8-16 times per
+    tick. This is especially valuable late-game when several own pieces exist.
+    """
+    directions = DIRECTIONS_FAST if cache["own_blob_count"] > 1 else DIRECTIONS
+    num_dirs = len(directions)
+
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    # Future locations for every direction and every considered own blob.
+    offsets = directions * step_distance
+    futures = own_locs[None, :, :] + offsets[:, None, :]
+
+    min_pos = own_rads + WALL_BUFFER
+    max_pos = ARENA_SIZE - own_rads - WALL_BUFFER
+    too_big = min_pos > max_pos
+    if np.any(too_big):
+        min_pos = np.where(too_big, own_rads, min_pos)
+        max_pos = np.where(too_big, ARENA_SIZE - own_rads, max_pos)
+
+    futures[:, :, 0] = np.minimum(
+        np.maximum(futures[:, :, 0], min_pos[None, :]), max_pos[None, :]
+    )
+    futures[:, :, 1] = np.minimum(
+        np.maximum(futures[:, :, 1], min_pos[None, :]), max_pos[None, :]
+    )
+
+    # -------- Enemy safety, batched over [direction, own blob, enemy].
+    if len(blob_locs) and len(own_locs):
+        danger_size = cache["enemy_danger_size"]
+        enemy_split_rads = cache["enemy_split_rads"]
+
+        delta = blob_locs[None, None, :, :] - futures[:, :, None, :]
+        dists = np.sqrt(np.sum(delta * delta, axis=3))
+        edge_dists = dists - own_rads[None, :, None] - blob_rads[None, None, :]
+
+        direct_danger = danger_size[None, None, :] > (
+            own_rads[None, :, None] * DANGER_DIRECT_RATIO
+        )
+        direct_active = direct_danger & (
+            edge_dists < cache["player_radius"] * DANGER_OVERRIDE_RANGE_MULT
+        )
+        direct_unsafe = direct_danger & (
+            edge_dists < own_rads[None, :, None] * DANGER_HARD_CLOSE_MULT
+        )
+
+        split_danger = enemy_split_rads[None, None, :] > (
+            own_rads[None, :, None] * DANGER_SPLIT_RATIO
+        )
+        split_active = split_danger & (
+            edge_dists < blob_rads[None, None, :] * DANGER_SPLIT_RANGE_MULT
+        )
+
+        enemy_active = np.any(direct_active | split_active, axis=(1, 2))
+        enemy_safe = ~np.any(direct_unsafe | split_active, axis=(1, 2))
+
+        score_dists = np.maximum(edge_dists, 1.0)
+        danger_scores = (
+            DANGER_WEIGHT
+            * (danger_size[None, None, :] / own_rads[None, :, None])
+            / (score_dists ** DANGER_DISTANCE_POWER)
+        )
+        scored = direct_danger | split_active
+        enemy_scores = -np.sum(np.where(scored, danger_scores, 0.0), axis=(1, 2))
+    else:
+        enemy_active = np.zeros(num_dirs, dtype=bool)
+        enemy_safe = np.ones(num_dirs, dtype=bool)
+        enemy_scores = np.zeros(num_dirs, dtype=float)
+
+    # -------- Virus path safety, batched over [direction, own blob, virus].
+    if len(virus_locs) and len(own_locs):
+        dangerous = own_rads[:, None] > virus_rads[None, :] * 1.1
+
+        if np.any(dangerous):
+            segments = futures - own_locs[None, :, :]
+            seg_len_sq = np.sum(segments * segments, axis=2)
+            denom = np.where(seg_len_sq <= 1e-9, 1.0, seg_len_sq)
+
+            to_viruses = virus_locs[None, :, :] - own_locs[:, None, :]
+            projection = np.sum(
+                to_viruses[None, :, :, :] * segments[:, :, None, :], axis=3
+            )
+            t = np.clip(projection / denom[:, :, None], 0.0, 1.0)
+            t = np.where(seg_len_sq[:, :, None] <= 1e-9, 0.0, t)
+
+            closest = own_locs[None, :, None, :] + t[:, :, :, None] * segments[:, :, None, :]
+            virus_delta = virus_locs[None, None, :, :] - closest
+            virus_dists = np.sqrt(np.sum(virus_delta * virus_delta, axis=3))
+            clearances = (
+                virus_dists
+                - own_rads[None, :, None]
+                - virus_rads[None, None, :]
+            )
+
+            virus_unsafe = np.any(
+                dangerous[None, :, :]
+                & (clearances < own_rads[None, :, None] * VIRUS_PATH_BUFFER_MULT),
+                axis=(1, 2),
+            )
+
+            safe_clearances = np.maximum(clearances, 1.0)
+            virus_penalties = VIRUS_DANGER_WEIGHT / (safe_clearances ** 3)
+            virus_scores = -np.sum(
+                np.where(dangerous[None, :, :], virus_penalties, 0.0),
+                axis=(1, 2),
+            )
+            virus_scores[virus_unsafe] = -OFF_MAP_PENALTY
+            virus_safe = ~virus_unsafe
+        else:
+            virus_scores = np.zeros(num_dirs, dtype=float)
+            virus_safe = np.ones(num_dirs, dtype=bool)
+    else:
+        virus_scores = np.zeros(num_dirs, dtype=float)
+        virus_safe = np.ones(num_dirs, dtype=bool)
+
+    # Player-centre movement data used by chase/roam scoring.
+    player_future = cache["player_pos"][None, :] + offsets
+    min_player = cache["player_radius"] + WALL_BUFFER
+    max_player = ARENA_SIZE - cache["player_radius"] - WALL_BUFFER
+    if min_player > max_player:
+        min_player = cache["player_radius"]
+        max_player = ARENA_SIZE - cache["player_radius"]
+    player_future = np.clip(player_future, min_player, max_player)
+    actual_moves = np.sqrt(np.sum((player_future - cache["player_pos"]) ** 2, axis=1))
+
+    total_scores = enemy_scores + virus_scores
+    safe = enemy_safe & virus_safe
+
+    reports = []
+    safe_reports = []
+    enemy_safe_reports = []
+    min_move = step_distance * 0.20
+
+    for idx, direction in enumerate(directions):
+        report = {
+            "idx": idx,
+            "dir": direction,
+            "dx": float(direction[0]),
+            "dy": float(direction[1]),
+            "enemy_active": bool(enemy_active[idx]),
+            "enemy_safe": bool(enemy_safe[idx]),
+            "virus_safe": bool(virus_safe[idx]),
+            "safe": bool(safe[idx]),
+            "score": float(total_scores[idx]),
+            "enemy_score": float(enemy_scores[idx]),
+            "virus_score": float(virus_scores[idx]),
+            "actual_move": float(actual_moves[idx]),
+            "future_x": float(player_future[idx, 0]),
+            "future_y": float(player_future[idx, 1]),
+        }
+        reports.append(report)
+        if actual_moves[idx] >= min_move:
+            if safe[idx]:
+                safe_reports.append(report)
+            if enemy_safe[idx]:
+                enemy_safe_reports.append(report)
+
+    cache["enemy_active"] = bool(np.any(enemy_active))
+    cache["move_reports"] = reports
+    cache["safe_reports"] = safe_reports
+    cache["enemy_safe_reports"] = enemy_safe_reports
+
+
+def cache_frame(game):
+    cache = cache_raw(game)
+    # Enemy velocity is only useful for chase, and chase is disabled while split.
+    # Skipping matching in split states saves late-game CPU.
+    if cache["own_blob_count"] == 1:
+        cache_enemy_velocity(cache)
+    else:
+        cache["blob_vels"] = np.zeros_like(cache["blob_locs"], dtype=float)
+
+    cache_enemy(cache)
+    cache_virus_memory(cache)
+
+    step_distance = STEP_DISTANCE_MULT * cache["player_radius"]
+    cache["step_distance"] = step_distance
+    cache_move_reports(cache, step_distance)
+
+    return cache
+
+
+# =========================
+# Split helpers
+# =========================
+
+def split_path_safe(cache, start_pos, split_radius, split_landing):
+    score = score_virus_segment(
+        cache,
+        start_pos,
+        split_landing,
+        split_radius,
+        SPLIT_VIRUS_BUFFER_MULT,
+    )
+    return score > -OFF_MAP_PENALTY / 2
+
+
+def split_candidate(launcher_pos, launcher_radius, target_pos, target_radius):
+    """Return exact split geometry if this launcher can reach target."""
+    split_radius = launcher_radius / np.sqrt(2.0)
+    split_range = launcher_radius * SPLIT_RANGE_MULT
+
+    vector = target_pos - launcher_pos
+    dist = np.linalg.norm(vector)
+    if dist <= 1e-9:
+        return None
+
+    direction = vector / dist
+    safe_range = split_range * SPLIT_RANGE_SAFETY_MULT
+    max_hit_dist = safe_range + split_radius + target_radius
+    reach_margin = max_hit_dist - dist
+
+    if reach_margin <= launcher_radius * SPLIT_REACH_MARGIN_MULT:
+        return None
+
+    split_landing = launcher_pos + direction * split_range
+
+    return {
+        "dir": direction,
+        "split_radius": split_radius,
+        "split_landing": split_landing,
+        "dist": float(dist),
+        "reach_margin": float(reach_margin),
+    }
+
+
+def split_landing_enemy_safe(cache, landing_pos, split_radius, launcher_radius, target_idx):
+    """Check that the new split piece is not landing next to something that eats it."""
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
+
+    if len(blob_locs) == 0:
+        return True
+
+    danger_size = np.maximum(blob_rads, merged_rads)
+    dists = np.linalg.norm(blob_locs - landing_pos, axis=1)
+    edge_dists = dists - split_radius - blob_rads
+
+    dangerous = danger_size > split_radius * SPLIT_LANDING_DANGER_RATIO
+    nearby = edge_dists < launcher_radius * SPLIT_POST_DANGER_RANGE_MULT
+
+    # Ignore the intended victim, because the whole point is to land on it.
+    if 0 <= target_idx < len(dangerous):
+        dangerous[target_idx] = False
+
+    return not bool(np.any(dangerous & nearby))
+
+def virus_enemy_safe(cache, virus_pos, virus_rad):
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    merged_rads = cache["merged_rads"]
+
+    if len(blob_locs) == 0:
+        return True
+
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+    estimated_piece_radius = player_radius * VIRUS_FARM_PIECE_RADIUS_MULT
+    danger_size = np.maximum(blob_rads, merged_rads)
+
+    can_eat_pieces = danger_size > estimated_piece_radius * 1.08
+
+    dists_to_player = np.linalg.norm(blob_locs - player_pos, axis=1)
+    edge_to_player = dists_to_player - player_radius - blob_rads
+
+    dists_to_virus = np.linalg.norm(blob_locs - virus_pos, axis=1)
+    edge_to_virus = dists_to_virus - virus_rad - blob_rads
+
+    close_to_player = edge_to_player < player_radius * VIRUS_FARM_ENEMY_RANGE_MULT
+    close_to_virus = edge_to_virus < player_radius * VIRUS_FARM_ENEMY_RANGE_MULT
+
+    return not bool(np.any(can_eat_pieces & (close_to_player | close_to_virus)))
+
+
+def enemy_near_wall(pos):
+    x, y = pos
+    dist_left = x
+    dist_right = ARENA_SIZE - x
+    dist_bottom = y
+    dist_top = ARENA_SIZE - y
+
+    near_wall = min(dist_left, dist_right, dist_bottom, dist_top) < CHASE_WALL_DIST
+    near_corner = (
+        (dist_left < CHASE_WALL_DIST or dist_right < CHASE_WALL_DIST)
+        and (dist_bottom < CHASE_WALL_DIST or dist_top < CHASE_WALL_DIST)
+    )
+    return near_wall or near_corner
+
+
+def chase_block_point(enemy_pos, enemy_radius, player_radius, enemy_vel=None):
+    """Point that cuts off the enemy's escape route.
+
+    In open space, being directly behind the enemy just follows their trail.
+    This point is biased to the centre-side of the enemy, with a smaller bias
+    toward their current velocity, so we intercept/cut off instead of shadowing.
+    """
+    center = np.array([ARENA_SIZE / 2.0, ARENA_SIZE / 2.0], dtype=float)
+    centre_dir = vec_norm(center - enemy_pos)
+
+    if centre_dir is None:
+        return enemy_pos.copy(), None
+
+    block_dir = centre_dir.copy()
+
+    if enemy_vel is not None:
+        vel_dir = vec_norm(enemy_vel)
+        if vel_dir is not None:
+            mixed = 0.75 * centre_dir + 0.25 * vel_dir
+            mixed_dir = vec_norm(mixed)
+            if mixed_dir is not None:
+                block_dir = mixed_dir
+
+    offset = min(player_radius * 1.15, enemy_radius * 2.5 + player_radius * 0.45)
+    block_point = enemy_pos + block_dir * offset
+
+    block_point[0] = np.clip(block_point[0], 0.0, ARENA_SIZE)
+    block_point[1] = np.clip(block_point[1], 0.0, ARENA_SIZE)
+
+    return block_point, centre_dir
+
+
+# =========================
+# Food memory helpers
+# =========================
+
+def food_key(food_pos):
+    return (round(float(food_pos[0]), 1), round(float(food_pos[1]), 1))
+
+
+def food_update_blacklist():
+    global FOOD_BLACKLIST
+
+    expired = []
+    for key in FOOD_BLACKLIST:
+        FOOD_BLACKLIST[key] -= 1
+        if FOOD_BLACKLIST[key] <= 0:
+            expired.append(key)
+
+    for key in expired:
+        del FOOD_BLACKLIST[key]
+
+
+def food_blacklist(key):
+    global FOOD_TARGET_KEY, FOOD_TARGET_TICKS
+    global FOOD_TARGET_NO_PROGRESS, FOOD_TARGET_LAST_DIST
+
+    if key is None:
+        return
+
+    FOOD_BLACKLIST[key] = FOOD_BLACKLIST_TICKS
+
+    if FOOD_TARGET_KEY == key:
+        FOOD_TARGET_KEY = None
+        FOOD_TARGET_TICKS = 0
+        FOOD_TARGET_NO_PROGRESS = 0
+        FOOD_TARGET_LAST_DIST = None
+
+
+def food_unreachable_corner(food_pos):
+    x, y = food_pos
+    near_left = x < FOOD_CORNER_MARGIN
+    near_right = ARENA_SIZE - x < FOOD_CORNER_MARGIN
+    near_bottom = y < FOOD_CORNER_MARGIN
+    near_top = ARENA_SIZE - y < FOOD_CORNER_MARGIN
+    return (near_left or near_right) and (near_bottom or near_top)
+
+
+def food_ranked_targets(cache):
+    global FOOD_TARGET_KEY, FOOD_TARGET_TICKS
+    global FOOD_TARGET_NO_PROGRESS, FOOD_TARGET_LAST_DIST
+
+    # Food clustering is only needed if we actually reach food/roam mode.
+    # Higher-priority split/chase/virus ticks should not pay the pairwise cost.
+    if "food_scores" not in cache:
+        cache_food(cache)
+
+    food_update_blacklist()
+
+    food_locs = cache["food_locs"]
+    if len(food_locs) == 0:
+        FOOD_TARGET_KEY = None
+        FOOD_TARGET_TICKS = 0
+        FOOD_TARGET_NO_PROGRESS = 0
+        FOOD_TARGET_LAST_DIST = None
+        return []
+
+    food_keys = [food_key(food_pos) for food_pos in food_locs]
+    dists = cache["food_dists"]
+    dirs = cache["food_dirs"]
+    scores = cache["food_scores"].copy()
+
+    current_idx = None
+    if FOOD_TARGET_KEY is not None:
+        for i, key in enumerate(food_keys):
+            if key == FOOD_TARGET_KEY:
+                current_idx = i
+                break
+        if current_idx is None:
+            FOOD_TARGET_KEY = None
+            FOOD_TARGET_TICKS = 0
+            FOOD_TARGET_NO_PROGRESS = 0
+            FOOD_TARGET_LAST_DIST = None
+
+    valid = dists > FOOD_MIN_TARGET_DIST
+    for i, key in enumerate(food_keys):
+        if key in FOOD_BLACKLIST or food_unreachable_corner(food_locs[i]):
+            valid[i] = False
+
+    if not np.any(valid):
+        return []
+
+    reached_dist = max(
+        FOOD_REACHED_DIST_MIN,
+        cache["player_radius"] * FOOD_REACHED_DIST_MULT,
+    )
+
+    if current_idx is not None and valid[current_idx]:
+        current_dist = dists[current_idx]
+        FOOD_TARGET_TICKS += 1
+
+        if FOOD_TARGET_LAST_DIST is not None:
+            if current_dist >= FOOD_TARGET_LAST_DIST - 0.03:
+                FOOD_TARGET_NO_PROGRESS += 1
+            else:
+                FOOD_TARGET_NO_PROGRESS = 0
+
+        FOOD_TARGET_LAST_DIST = current_dist
+
+        if (
+            current_dist < reached_dist
+            or FOOD_TARGET_TICKS >= FOOD_TARGET_MAX_TICKS
+            or FOOD_TARGET_NO_PROGRESS >= FOOD_NO_PROGRESS_LIMIT
+        ):
+            food_blacklist(FOOD_TARGET_KEY)
+            current_idx = None
+
+    scores[~valid] = -1.0
+
+    if current_idx is not None and scores[current_idx] > 0:
+        scores[current_idx] *= 1.25
+
+    candidates = []
+    for idx in np.argsort(scores)[::-1]:
+        if scores[idx] <= 0:
+            break
+
+        direction = dirs[idx]
+        candidates.append((
+            float(scores[idx]),
+            float(direction[0]),
+            float(direction[1]),
+            food_keys[idx],
+        ))
+
+    if candidates and FOOD_TARGET_KEY is None:
+        FOOD_TARGET_KEY = candidates[0][3]
+        FOOD_TARGET_TICKS = 0
+        FOOD_TARGET_NO_PROGRESS = 0
+        FOOD_TARGET_LAST_DIST = None
+
+    return candidates
+
+
+# =========================
+# State helpers
+# =========================
+
+def stuck_now(cache):
+    global LAST_POSITION, STUCK_TICKS
+
+    pos = cache["player_pos"]
+    r = cache["player_radius"]
+
+    if LAST_POSITION is None:
+        LAST_POSITION = pos.copy()
+        return False
+
+    moved = np.linalg.norm(pos - LAST_POSITION)
+    if moved < r * STUCK_MOVE_EPS_MULT:
+        STUCK_TICKS += 1
+    else:
+        STUCK_TICKS = 0
+
+    LAST_POSITION = pos.copy()
+    return STUCK_TICKS >= STUCK_TICK_LIMIT
+
+
+# =========================
+# Override functions
+# =========================
+
+def override_escape(cache, step_distance):
+    if not cache["enemy_active"]:
+        return None
+
+    best_score = -float("inf")
+    best_report = None
+
+    for report in cache["move_reports"]:
+        if not report["virus_safe"]:
+            continue
+
+        score = report["enemy_score"]
+        if report["actual_move"] < step_distance * 0.20:
+            score -= DANGER_WALL_PUSH_PENALTY
+        else:
+            score += DANGER_MOVE_REWARD * report["actual_move"]
+
+        if score > best_score:
+            best_score = score
+            best_report = report
+
+    if best_report is None:
+        return None
+
+    return report_to_result(best_report, split=False)
+
+
+def override_unstuck(cache, step_distance):
+    if not stuck_now(cache):
+        return None
+
+    center = np.array([ARENA_SIZE / 2.0, ARENA_SIZE / 2.0], dtype=float)
+    center_dir = vec_norm(center - cache["player_pos"])
+
+    best_score = -float("inf")
+    best_report = None
+
+    for report in cache["safe_reports"]:
+        if report["actual_move"] < step_distance * 0.25:
+            continue
+
+        score = 0.0
+        score += STUCK_MOVE_WEIGHT * report["actual_move"]
+        score += report["score"]
+        if center_dir is not None:
+            score += STUCK_CENTER_WEIGHT * np.dot(report["dir"], center_dir)
+
+        if score > best_score:
+            best_score = score
+            best_report = report
+
+    if best_report is None:
+        return None
+
+    return report_to_result(best_report, split=False)
+
+
+def override_split(cache, step_distance):
+    """Exact-aim split kill with bounded late-game work.
+
+    v8 optimisation: first collect cheap geometry candidates, then run the
+    expensive virus-path / landing-danger / exact-enemy checks only on the best
+    few. This keeps the strong multi-split behaviour but avoids cumulative
+    timeout when many enemies and own blobs are visible.
+    """
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+    own_blob_count = cache["own_blob_count"]
+    player_radius = cache["player_radius"]
+
+    max_blobs = SPLIT_HUGE_MAX_OWN_BLOBS if player_radius >= SPLIT_HUGE_RADIUS else SPLIT_MAX_OWN_BLOBS
+    if own_blob_count > max_blobs:
+        return None
+
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    if len(blob_locs) == 0 or len(own_locs) == 0:
+        return None
+
+    late_fast = own_blob_count > 1 or player_radius >= SPLIT_HUGE_RADIUS
+    max_targets = 5 if late_fast else SPLIT_MAX_TARGETS
+    max_launchers = 2 if late_fast else SPLIT_MAX_LAUNCHERS
+    top_exact = 1 if late_fast else SPLIT_TOP_EXACT_CHECKS
+    precheck_limit = 6 if late_fast else SPLIT_PRECHECK_LIMIT
+
+    max_split_radius = float(np.max(own_rads)) / np.sqrt(2.0)
+    target_ok = blob_rads < max_split_radius / SPLIT_EAT_RATIO
+    if not np.any(target_ok):
+        return None
+
+    target_indices = np.where(target_ok)[0]
+    target_order = target_indices[np.argsort(blob_rads[target_indices])[::-1]][:max_targets]
+
+    cheap_candidates = []
+
+    for target_idx in target_order:
+        target_pos = blob_locs[target_idx]
+        target_rad = blob_rads[target_idx]
+
+        launcher_dists = np.sum((own_locs - target_pos) ** 2, axis=1)
+        launcher_order = np.argsort(launcher_dists)[:max_launchers]
+
+        for launcher_i in launcher_order:
+            launcher_pos = own_locs[launcher_i]
+            launcher_radius = own_rads[launcher_i]
+
+            if launcher_radius < SPLIT_MIN_RADIUS:
+                continue
+
+            if target_rad <= launcher_radius * SPLIT_TARGET_MIN_RADIUS_MULT:
+                continue
+
+            candidate = split_candidate(
+                launcher_pos,
+                launcher_radius,
+                target_pos,
+                target_rad,
+            )
+            if candidate is None:
+                continue
+
+            split_radius = candidate["split_radius"]
+            if split_radius <= target_rad * SPLIT_EAT_RATIO:
+                continue
+
+            split_dir = candidate["dir"]
+            score = 0.0
+            score += target_rad * 4.0
+            score -= candidate["dist"] * 0.25
+            score += candidate["reach_margin"] * 0.35
+            score -= own_blob_count * 0.75
+
+            cheap_candidates.append((
+                score,
+                float(split_dir[0]),
+                float(split_dir[1]),
+                launcher_pos,
+                float(launcher_radius),
+                float(split_radius),
+                candidate["split_landing"],
+                int(target_idx),
+            ))
+
+            # Keep cheap list bounded throughout the loop.
+            if len(cheap_candidates) > precheck_limit * 2:
+                cheap_candidates.sort(key=lambda item: item[0], reverse=True)
+                cheap_candidates = cheap_candidates[:precheck_limit]
+
+    if not cheap_candidates:
+        return None
+
+    cheap_candidates.sort(key=lambda item: item[0], reverse=True)
+
+    checked_exact = 0
+    for _, dx, dy, launcher_pos, launcher_radius, split_radius, split_landing, target_idx in cheap_candidates[:precheck_limit]:
+        if not split_path_safe(cache, launcher_pos, split_radius, split_landing):
+            continue
+
+        if not split_landing_enemy_safe(
+            cache,
+            split_landing,
+            split_radius,
+            launcher_radius,
+            target_idx,
+        ):
+            continue
+
+        # Exact enemy safety is the most expensive finalist check; bound it.
+        enemy = score_enemy_threat(cache, dx, dy, step_distance)
+        checked_exact += 1
+        if enemy["safe"]:
+            return dx, dy, True
+
+        if checked_exact >= top_exact:
+            break
+
+    return None
+
+def override_virus(cache, step_distance):
+    global VIRUS_TARGET_KEY, VIRUS_TARGET_TICKS
+
+    if cache["own_blob_count"] != 1:
+        VIRUS_TARGET_KEY = None
+        VIRUS_TARGET_TICKS = 0
+        return None
+
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+
+    candidates = []
+    for key, info in VIRUS_MEMORY.items():
+        virus_pos = info["pos"]
+        virus_rad = info["radius"]
+
+        if player_radius <= virus_rad * VIRUS_FARM_EAT_RATIO:
+            continue
+
+        dist = np.linalg.norm(virus_pos - player_pos)
+        candidates.append((dist, key, virus_pos, virus_rad))
+
+    if not candidates:
+        VIRUS_TARGET_KEY = None
+        VIRUS_TARGET_TICKS = 0
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > VIRUS_MAX_CANDIDATES:
+        candidates = candidates[:VIRUS_MAX_CANDIDATES]
+
+    visible_keys = {virus_key(pos) for pos in cache["virus_locs"]}
+    reached_dist = max(1.0, player_radius * VIRUS_MEMORY_REACHED_DIST_MULT)
+
+    # Lock the same virus briefly. This prevents left/right target swapping and
+    # the visible-virus wobble that was happening near virus clusters.
+    locked = None
+    if VIRUS_TARGET_KEY is not None and VIRUS_TARGET_TICKS < VIRUS_LOCK_TICKS:
+        for item in candidates:
+            if item[1] == VIRUS_TARGET_KEY:
+                locked = item
+                break
+
+    if locked is not None:
+        best_dist = candidates[0][0]
+        # Only switch away if another virus is dramatically closer.
+        if best_dist < locked[0] * VIRUS_SWITCH_DIST_MULT:
+            ordered = candidates
+        else:
+            ordered = [locked] + [item for item in candidates if item[1] != VIRUS_TARGET_KEY]
+    else:
+        ordered = candidates
+
+    for dist, key, virus_pos, virus_rad in ordered:
+        is_visible = key in visible_keys
+
+        if dist < reached_dist and not is_visible:
+            if key in VIRUS_MEMORY:
+                del VIRUS_MEMORY[key]
+            if VIRUS_TARGET_KEY == key:
+                VIRUS_TARGET_KEY = None
+                VIRUS_TARGET_TICKS = 0
+            continue
+
+        if is_visible and not virus_enemy_safe(cache, virus_pos, virus_rad):
+            continue
+
+        direction = vec_norm(virus_pos - player_pos)
+        if direction is None:
+            continue
+
+        if is_visible:
+            # Important: visible virus farming needs exact aiming. Snapping to
+            # the nearest cached 16-way report caused oscillation around viruses.
+            if not exact_move_safe(
+                cache,
+                direction,
+                step_distance,
+                check_virus=False,
+                enemy_only=True,
+            ):
+                continue
+
+            if VIRUS_TARGET_KEY == key:
+                VIRUS_TARGET_TICKS += 1
+            else:
+                VIRUS_TARGET_KEY = key
+                VIRUS_TARGET_TICKS = 0
+
+            return float(direction[0]), float(direction[1]), False
+
+        # Travelling toward remembered unseen virus: stay conservative and keep
+        # using cached safe movement, because we are not intentionally popping yet.
+        report = report_towards(
+            cache,
+            virus_pos - player_pos,
+            reports=cache["safe_reports"],
+            danger_scale=0.001,
+        )
+
+        if report is None:
+            continue
+
+        if VIRUS_TARGET_KEY == key:
+            VIRUS_TARGET_TICKS += 1
+        else:
+            VIRUS_TARGET_KEY = key
+            VIRUS_TARGET_TICKS = 0
+
+        return report_to_result(report, split=False)
+
+    return None
+
+
+def override_chase(cache, step_distance):
+    global CHASE_TARGET_KEY, CHASE_TARGET_TICKS, CHASE_LOST_TICKS
+
+    if cache["own_blob_count"] != 1:
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
+        return None
+
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    blob_player_ids = cache["blob_player_ids"]
+
+    if len(blob_locs) == 0:
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
+        return None
+
+    edge_dists = cache["enemy_edge_dists"]
+    edible = cache["enemy_edible"]
+    player_pos = cache["player_pos"]
+    player_radius = cache["player_radius"]
+    blob_vels = cache.get("blob_vels")
+
+    in_range = edge_dists < player_radius * CHASE_RANGE_MULT
+    candidates = edible & in_range
+
+    if not np.any(candidates):
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
+        return None
+
+    candidate_indices = np.where(candidates)[0]
+
+    if CHASE_TARGET_KEY is not None and CHASE_TARGET_TICKS < CHASE_LOCK_TICKS:
+        locked = [
+            idx for idx in candidate_indices
+            if int(blob_player_ids[idx]) == CHASE_TARGET_KEY
+        ]
+        if locked:
+            candidate_indices = np.array(locked, dtype=int)
+
+    best_score = -float("inf")
+    best_report = None
+    best_target_idx = None
+    best_closing = 0.0
+    best_wall = False
+    best_aim_point = None
+    best_exact_direct = False
+
+    for idx in candidate_indices:
+        enemy_vel = blob_vels[idx] if blob_vels is not None and len(blob_vels) > idx else np.array([0.0, 0.0], dtype=float)
+        enemy_speed = np.linalg.norm(enemy_vel)
+
+        # Dynamic prediction: lead more when far away, less when already close.
+        lead_ticks = np.clip(
+            edge_dists[idx] / max(step_distance + enemy_speed, 1.0),
+            1.0,
+            CHASE_LEAD_TICKS,
+        )
+        predicted_pos = blob_locs[idx] + enemy_vel * lead_ticks
+        predicted_pos[0] = np.clip(predicted_pos[0], 0.0, ARENA_SIZE)
+        predicted_pos[1] = np.clip(predicted_pos[1], 0.0, ARENA_SIZE)
+
+        current_edge = edge_dists[idx]
+        near_wall = enemy_near_wall(predicted_pos)
+        catchable_now = current_edge < max(player_radius * CHASE_DIRECT_EDGE_MULT, step_distance * 1.25)
+
+        block_point, centre_dir = chase_block_point(
+            predicted_pos,
+            blob_rads[idx],
+            player_radius,
+            enemy_vel,
+        )
+
+        direct_finish = near_wall or catchable_now
+        aim_point = predicted_pos if direct_finish else block_point
+        direct_dir = vec_norm(predicted_pos - player_pos)
+
+        for report in cache["safe_reports"]:
+            future_pos = np.array([report["future_x"], report["future_y"]], dtype=float)
+            future_edge = np.linalg.norm(predicted_pos - future_pos) - player_radius - blob_rads[idx]
+            closing = current_edge - future_edge
+
+            score = 0.0
+            score += CHASE_SIZE_WEIGHT * blob_rads[idx]
+            score -= max(current_edge, 0.0) * 0.20
+            score += 0.0002 * report["score"]
+            score += CHASE_STICKINESS_WEIGHT * np.dot(report["dir"], LAST_DIRECTION)
+
+            if direct_finish:
+                # If we probably can catch them, be much more direct/aggressive.
+                score += CHASE_CLOSE_WEIGHT * 1.35 * closing
+                if direct_dir is not None:
+                    score += 120.0 * np.dot(report["dir"], direct_dir)
+                if near_wall:
+                    score += 18.0
+            else:
+                # Open space: get to the centre-side blocking point so they are
+                # forced outward instead of circling around us forever.
+                block_dist = np.linalg.norm(block_point - future_pos)
+                score += 0.75 * CHASE_CLOSE_WEIGHT * closing
+                score -= CHASE_BLOCK_DIST_WEIGHT * block_dist
+
+                if centre_dir is not None:
+                    future_from_enemy = vec_norm(future_pos - predicted_pos)
+                    if future_from_enemy is not None:
+                        centre_side = np.dot(future_from_enemy, centre_dir)
+                        score += CHASE_CENTER_SIDE_WEIGHT * centre_side
+
+            if CHASE_TARGET_KEY == int(blob_player_ids[idx]):
+                score += 12.0
+
+            if score > best_score:
+                best_score = score
+                best_report = report
+                best_target_idx = idx
+                best_closing = closing
+                best_wall = near_wall
+                best_aim_point = aim_point
+                best_exact_direct = direct_finish
+
+    if best_report is None or best_target_idx is None:
+        return None
+
+    # Prefer exact aiming toward the chosen intercept/block point, but only if
+    # the exact vector is safe. The cached report remains a safe fallback.
+    exact_dir = vec_norm(best_aim_point - player_pos) if best_aim_point is not None else None
+    if exact_dir is not None:
+        if exact_move_safe(cache, exact_dir, step_distance, check_virus=True, enemy_only=False):
+            chosen_result = (float(exact_dir[0]), float(exact_dir[1]), False)
+        else:
+            chosen_result = report_to_result(best_report, split=False)
+    else:
+        chosen_result = report_to_result(best_report, split=False)
+
+    # Do not give up too quickly while attempting a trap. Trapping may briefly
+    # reduce direct closing distance but still improves position.
+    if best_closing < CHASE_MIN_CLOSING_RATE and not best_wall and best_exact_direct:
+        CHASE_LOST_TICKS += 1
+    else:
+        CHASE_LOST_TICKS = 0
+
+    if CHASE_LOST_TICKS >= CHASE_LOST_LIMIT:
+        CHASE_TARGET_KEY = None
+        CHASE_TARGET_TICKS = 0
+        CHASE_LOST_TICKS = 0
+        return None
+
+    chosen_key = int(blob_player_ids[best_target_idx])
+    if CHASE_TARGET_KEY == chosen_key:
+        CHASE_TARGET_TICKS += 1
+    else:
+        CHASE_TARGET_KEY = chosen_key
+        CHASE_TARGET_TICKS = 0
+
+    return chosen_result
+
+def override_food_roam(cache, step_distance):
+    global ROAM_DIRECTION, ROAM_TICKS
+
+    food_candidates = food_ranked_targets(cache)
+
+    for _, dx, dy, key in food_candidates:
+        target_vec = np.array([dx, dy], dtype=float)
+        report = report_towards(cache, target_vec, reports=cache["safe_reports"])
+
+        if report is None:
+            food_blacklist(key)
+            continue
+
+        return report_to_result(report, split=False)
+
+    center = np.array([ARENA_SIZE / 2.0, ARENA_SIZE / 2.0], dtype=float)
+    center_dir = vec_norm(center - cache["player_pos"])
+
+    if ROAM_DIRECTION is not None and ROAM_TICKS < ROAM_LOCK_TICKS:
+        report = report_for_direction(cache, ROAM_DIRECTION)
+        if report is not None and report["safe"] and report["actual_move"] >= step_distance * 0.20:
+            ROAM_TICKS += 1
+            return report_to_result(report, split=False)
+
+    best_score = -float("inf")
+    best_report = None
+
+    for report in cache["safe_reports"]:
+        score = 0.0
+        score += report["score"]
+        score += ROAM_MOVE_WEIGHT * report["actual_move"]
+        score += ROAM_STICKINESS_WEIGHT * np.dot(report["dir"], LAST_DIRECTION)
+
+        if center_dir is not None:
+            score += ROAM_CENTER_WEIGHT * np.dot(report["dir"], center_dir)
+
+        if score > best_score:
+            best_score = score
+            best_report = report
+
+    if best_report is None:
+        ROAM_DIRECTION = None
+        ROAM_TICKS = 0
+        return None
+
+    ROAM_DIRECTION = np.array(best_report["dir"], dtype=float)
+    ROAM_TICKS = 0
+
+    return report_to_result(best_report, split=False)
+
+
+def override_fallback(cache, step_distance):
+    reports = cache["safe_reports"]
+
+    if not reports:
+        fallback = vec_norm(LAST_DIRECTION)
+        if fallback is None:
+            return 1.0, 0.0, False
+        return float(fallback[0]), float(fallback[1]), False
+
+    best_score = -float("inf")
+    best_report = None
+
+    for report in reports:
+        score = 0.0
+        score += report["score"]
+        score += 0.30 * score_food_position(cache, report["future_x"], report["future_y"])
+        # Enemy danger is already represented inside report["score"]. Avoid
+        # another per-direction enemy scan in the final fallback.
+        score += TURN_WEIGHT * np.dot(report["dir"], LAST_DIRECTION)
+
+        if score > best_score:
+            best_score = score
+            best_report = report
+
+    return report_to_result(best_report, split=False)
+
+
+# =========================
+# Direction choice
+# =========================
+
+def choose_direction(game: Game):
+    global LAST_DIRECTION
+
+    cache = cache_frame(game)
+    step_distance = cache["step_distance"]
+
+    overrides = [
+        override_escape,
+        override_unstuck,
+        override_split,
+        override_chase,
+        override_virus,
+        override_food_roam,
+        override_fallback,
+    ]
+
+    for override in overrides:
+        result = override(cache, step_distance)
+        if result is None:
+            continue
+
+        dx, dy, should_split = result
+        final_direction = vec_norm(np.array([dx, dy], dtype=float))
+
+        if final_direction is None:
+            final_direction = LAST_DIRECTION
+
+        LAST_DIRECTION = final_direction
+
+        return (
+            float(final_direction[0]),
+            float(final_direction[1]),
+            bool(should_split),
+            cache,
+        )
+
+    return 1.0, 0.0, False, cache
+
+
+# =========================
+# Main loop
+# =========================
 
 def main() -> None:
     game = Game()
 
     while True:
         query = game.get_next_query()
+
         match query:
             case QueryMovePlayer():
-                dx, dy, split = choose_direction(game)
-                game.send_move(
-                    MovePlayer(
-                        player_id=game.state.me.player_id,
-                        direction=DirectionModel(x=dx, y=dy),
-                        split=split,
+                try:
+                    dx, dy, should_split, cache = choose_direction(game)
+
+                    game.send_move(
+                        MovePlayer(
+                            player_id=cache["player_id"],
+                            direction=DirectionModel(
+                                x=float(dx),
+                                y=float(dy),
+                            ),
+                            split=bool(should_split),
+                        )
                     )
-                )
+
+                except Exception:
+                    game.send_move(
+                        MovePlayer(
+                            player_id=game.state.me.player_id,
+                            direction=DirectionModel(
+                                x=1.0,
+                                y=0.0,
+                            ),
+                            split=False,
+                        )
+                    )
+
             case _:
                 raise RuntimeError(f"Unsupported query type: {type(query)}")
 
