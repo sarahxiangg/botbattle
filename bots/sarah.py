@@ -43,6 +43,14 @@ FOOD_TARGET_MAX_TICKS = 10
 FOOD_NO_PROGRESS_LIMIT = 4
 FOOD_BLACKLIST_TICKS = 25
 FOOD_CORNER_MARGIN = 0.45
+FOOD_CORNER_RADIUS_MULT = 1.6  # corner exclusion also scales with own size
+
+# Corner/dead-end awareness. Danger/virus scoring alone doesn't discourage
+# heading into a pocket where two walls meet, so most overrides that read
+# report["score"] never learn to avoid it until they're already stuck there.
+CORNER_AWARE_RADIUS_MULT = 6.0
+CORNER_PRESSURE_WEIGHT = 2200.0
+CORNER_ESCAPE_WEIGHT = 0.6
 FOOD_CLUSTER_RADIUS = 4.0
 FOOD_CLUSTER_WEIGHT = 0.55
 FOOD_DISTANCE_POWER = 1.15
@@ -157,6 +165,23 @@ def vec_norm(vec):
     if norm <= 1e-9:
         return None
     return vec / norm
+
+
+def corner_pressure_batch(x_arr, y_arr, player_radius):
+    """How boxed-in a set of positions is, in [0, 1].
+
+    Only high when BOTH axes are close to a wall (an actual corner pocket);
+    being near a single wall alone stays low, since one escape axis remains
+    free. The ramp-in distance scales with player_radius so a bigger blob
+    starts feeling squeezed further out from the literal corner point, which
+    is what actually determines maneuverability.
+    """
+    scale = max(player_radius * CORNER_AWARE_RADIUS_MULT, 3.0)
+    dx_wall = np.minimum(x_arr, ARENA_SIZE - x_arr)
+    dy_wall = np.minimum(y_arr, ARENA_SIZE - y_arr)
+    close_x = np.clip(1.0 - dx_wall / scale, 0.0, 1.0)
+    close_y = np.clip(1.0 - dy_wall / scale, 0.0, 1.0)
+    return close_x * close_y
 
 
 def clamp_for_radius(x, y, radius):
@@ -436,9 +461,7 @@ def score_own_blob_virus(cache, dx, dy, step_distance):
     if len(own_locs) == 0 or len(virus_locs) == 0:
         return 0.0
 
-    dangerous = cache.get("virus_dangerous_mask")
-    if dangerous is None:
-        dangerous = own_rads[:, None] > virus_rads[None, :] * 1.1
+    dangerous = own_rads[:, None] > virus_rads[None, :] * 1.1
     if not np.any(dangerous):
         return 0.0
 
@@ -449,9 +472,7 @@ def score_own_blob_virus(cache, dx, dy, step_distance):
     segments = ends - starts
     seg_len_sq = np.sum(segments * segments, axis=1)
 
-    to_viruses = cache.get("own_to_viruses")
-    if to_viruses is None:
-        to_viruses = virus_locs[None, :, :] - starts[:, None, :]
+    to_viruses = virus_locs[None, :, :] - starts[:, None, :]
 
     # Projection of each virus onto each own-blob movement segment.
     denom = np.where(seg_len_sq <= 1e-9, 1.0, seg_len_sq)
@@ -498,17 +519,11 @@ def score_enemy_threat(cache, dx=0.0, dy=0.0, step_distance=0.0):
     dists = np.linalg.norm(blob_locs[None, :, :] - futures[:, None, :], axis=2)
     edge_dists = dists - own_rads[:, None] - blob_rads[None, :]
 
-    direct_danger = cache.get("direct_danger_mask")
-    if direct_danger is None:
-        direct_danger = danger_size[None, :] > own_rads[:, None] * DANGER_DIRECT_RATIO
-
-    split_danger = cache.get("split_danger_mask")
-    if split_danger is None:
-        split_danger = enemy_split_rads[None, :] > own_rads[:, None] * DANGER_SPLIT_RATIO
-
+    direct_danger = danger_size[None, :] > own_rads[:, None] * DANGER_DIRECT_RATIO
     direct_active = direct_danger & (edge_dists < player_radius * DANGER_OVERRIDE_RANGE_MULT)
     direct_unsafe = direct_danger & (edge_dists < own_rads[:, None] * DANGER_HARD_CLOSE_MULT)
 
+    split_danger = enemy_split_rads[None, :] > own_rads[:, None] * DANGER_SPLIT_RATIO
     split_near = edge_dists < blob_rads[None, :] * DANGER_SPLIT_RANGE_MULT
     split_active = split_danger & split_near
 
@@ -517,13 +532,9 @@ def score_enemy_threat(cache, dx=0.0, dy=0.0, step_distance=0.0):
 
     score_dists = np.maximum(edge_dists, 1.0)
     scored = direct_danger | split_active
-    danger_size_ratio = cache.get("danger_size_ratio")
-    if danger_size_ratio is None:
-        danger_size_ratio = danger_size[None, :] / own_rads[:, None]
-
     danger_scores = (
         DANGER_WEIGHT
-        * danger_size_ratio
+        * (danger_size[None, :] / own_rads[:, None])
         / (score_dists ** DANGER_DISTANCE_POWER)
     )
 
@@ -553,6 +564,168 @@ def score_move(cache, dx, dy, step_distance, check_virus=True):
         "future_x": float(future_x),
         "future_y": float(future_y),
     }
+
+
+def score_moves_batch(cache, directions, step_distance, check_virus=True):
+    """Vectorized equivalent of calling score_move() once per direction.
+
+    This computes the exact same per-direction quantities as score_move ->
+    score_enemy_threat / score_own_blob_virus, but does it for every direction
+    at once via broadcasting instead of looping in Python and re-entering NumPy
+    16 (or 8) separate times per tick. The formulas are untouched; only the
+    evaluation strategy changed. This is the main late-game CPU saver, since
+    cache_move_reports runs unconditionally every tick regardless of which
+    override ends up firing.
+    """
+    directions = np.asarray(directions, dtype=float)
+    num_dirs = len(directions)
+    deltas = directions * step_distance  # (D, 2)
+
+    own_locs = cache["own_locs"]
+    own_rads = cache["own_rads"]
+    num_own = len(own_locs)
+
+    # --- future positions of every own blob, for every direction: (D, O, 2) ---
+    futures_own = own_locs[None, :, :] + deltas[:, None, :]
+
+    if num_own > 0:
+        min_pos = own_rads + WALL_BUFFER
+        max_pos = ARENA_SIZE - own_rads - WALL_BUFFER
+        too_big = min_pos > max_pos
+        if np.any(too_big):
+            min_pos = np.where(too_big, own_rads, min_pos)
+            max_pos = np.where(too_big, ARENA_SIZE - own_rads, max_pos)
+        futures_own[:, :, 0] = np.clip(futures_own[:, :, 0], min_pos[None, :], max_pos[None, :])
+        futures_own[:, :, 1] = np.clip(futures_own[:, :, 1], min_pos[None, :], max_pos[None, :])
+
+    # --- enemy threat, batched over directions ---
+    blob_locs = cache["blob_locs"]
+    blob_rads = cache["blob_rads"]
+    player_radius = cache["player_radius"]
+
+    if len(blob_locs) == 0 or num_own == 0:
+        enemy_active = np.zeros(num_dirs, dtype=bool)
+        enemy_safe = np.ones(num_dirs, dtype=bool)
+        enemy_score = np.zeros(num_dirs, dtype=float)
+    else:
+        danger_size = cache.get("enemy_danger_size")
+        if danger_size is None or len(danger_size) != len(blob_rads):
+            danger_size = np.maximum(blob_rads, cache["merged_rads"])
+
+        enemy_split_rads = cache.get("enemy_split_rads")
+        if enemy_split_rads is None or len(enemy_split_rads) != len(blob_rads):
+            enemy_split_rads = blob_rads / np.sqrt(2.0)
+
+        # (D, O, E)
+        dists = np.linalg.norm(
+            blob_locs[None, None, :, :] - futures_own[:, :, None, :], axis=3
+        )
+        edge_dists = dists - own_rads[None, :, None] - blob_rads[None, None, :]
+
+        direct_danger = danger_size[None, None, :] > own_rads[None, :, None] * DANGER_DIRECT_RATIO
+        direct_active = direct_danger & (edge_dists < player_radius * DANGER_OVERRIDE_RANGE_MULT)
+        direct_unsafe = direct_danger & (edge_dists < own_rads[None, :, None] * DANGER_HARD_CLOSE_MULT)
+
+        split_danger = enemy_split_rads[None, None, :] > own_rads[None, :, None] * DANGER_SPLIT_RATIO
+        split_near = edge_dists < blob_rads[None, None, :] * DANGER_SPLIT_RANGE_MULT
+        split_active = split_danger & split_near
+
+        active_mask = direct_active | split_active
+        unsafe_mask = direct_unsafe | split_active
+
+        enemy_active = np.any(active_mask, axis=(1, 2))
+        enemy_safe = ~np.any(unsafe_mask, axis=(1, 2))
+
+        score_dists = np.maximum(edge_dists, 1.0)
+        scored = direct_danger | split_active
+        danger_scores = (
+            DANGER_WEIGHT
+            * (danger_size[None, None, :] / own_rads[None, :, None])
+            / (score_dists ** DANGER_DISTANCE_POWER)
+        )
+        enemy_score = -np.sum(np.where(scored, danger_scores, 0.0), axis=(1, 2))
+
+    # --- own-blob virus safety, batched over directions ---
+    virus_locs = cache["virus_locs"]
+    virus_rads = cache["virus_rads"]
+
+    if not check_virus or len(virus_locs) == 0 or num_own == 0:
+        virus_score = np.zeros(num_dirs, dtype=float)
+        virus_safe = np.ones(num_dirs, dtype=bool)
+    else:
+        dangerous = own_rads[:, None] > virus_rads[None, :] * 1.1  # (O, V)
+        if not np.any(dangerous):
+            virus_score = np.zeros(num_dirs, dtype=float)
+            virus_safe = np.ones(num_dirs, dtype=bool)
+        else:
+            starts = own_locs  # (O, 2)
+            segments = futures_own - starts[None, :, :]  # (D, O, 2)
+            seg_len_sq = np.sum(segments * segments, axis=2)  # (D, O)
+
+            to_viruses = virus_locs[None, None, :, :] - starts[None, :, None, :]  # (1, O, V, 2)
+            denom = np.where(seg_len_sq <= 1e-9, 1.0, seg_len_sq)[:, :, None]  # (D, O, 1)
+            t = np.sum(to_viruses * segments[:, :, None, :], axis=3) / denom  # (D, O, V)
+            t = np.clip(t, 0.0, 1.0)
+            zero_seg = seg_len_sq <= 1e-9  # (D, O)
+            t = np.where(zero_seg[:, :, None], 0.0, t)
+
+            closest = starts[None, :, None, :] + t[:, :, :, None] * segments[:, :, None, :]  # (D, O, V, 2)
+            dists_v = np.linalg.norm(virus_locs[None, None, :, :] - closest, axis=3)  # (D, O, V)
+            clearances = dists_v - own_rads[None, :, None] - virus_rads[None, None, :]
+
+            danger_broadcast = dangerous[None, :, :]  # (1, O, V)
+            unsafe_mask_v = danger_broadcast & (clearances < own_rads[None, :, None] * VIRUS_PATH_BUFFER_MULT)
+            unsafe_any = np.any(unsafe_mask_v, axis=(1, 2))  # (D,)
+
+            safe_clearances = np.maximum(clearances, 1.0)
+            v_scores = VIRUS_DANGER_WEIGHT / (safe_clearances ** 3)
+            virus_score = -np.sum(np.where(danger_broadcast, v_scores, 0.0), axis=(1, 2))
+            virus_score = np.where(unsafe_any, -OFF_MAP_PENALTY, virus_score)
+            virus_safe = ~unsafe_any
+
+    # --- reported (single-point) future position / actual move distance ---
+    min_p = player_radius + WALL_BUFFER
+    max_p = ARENA_SIZE - player_radius - WALL_BUFFER
+    if min_p > max_p:
+        min_p = player_radius
+        max_p = ARENA_SIZE - player_radius
+
+    future_player = cache["player_pos"][None, :] + deltas  # (D, 2)
+    future_player[:, 0] = np.clip(future_player[:, 0], min_p, max_p)
+    future_player[:, 1] = np.clip(future_player[:, 1], min_p, max_p)
+    actual_move = np.linalg.norm(future_player - cache["player_pos"][None, :], axis=1)
+
+    # Dead-end awareness: penalize directions that land somewhere boxed in by
+    # two walls at once, so roam/food/chase/virus scoring (all of which read
+    # report["score"]) naturally steer around corner pockets instead of only
+    # noticing a problem once already stuck in one.
+    corner_pressure = corner_pressure_batch(future_player[:, 0], future_player[:, 1], player_radius)
+    corner_score = -CORNER_PRESSURE_WEIGHT * corner_pressure
+
+    safe = enemy_safe & (virus_score > -OFF_MAP_PENALTY / 2)
+    total_score = enemy_score + virus_score + corner_score
+
+    reports = []
+    for i in range(num_dirs):
+        reports.append({
+            "idx": i,
+            "dir": directions[i],
+            "dx": float(directions[i, 0]),
+            "dy": float(directions[i, 1]),
+            "enemy_active": bool(enemy_active[i]),
+            "enemy_safe": bool(enemy_safe[i]),
+            "virus_safe": bool(virus_safe[i]),
+            "safe": bool(safe[i]),
+            "score": float(total_score[i]),
+            "enemy_score": float(enemy_score[i]),
+            "virus_score": float(virus_score[i]),
+            "corner_score": float(corner_score[i]),
+            "actual_move": float(actual_move[i]),
+            "future_x": float(future_player[i, 0]),
+            "future_y": float(future_player[i, 1]),
+        })
+
+    return reports
 
 
 def score_food_position(cache, x, y):
@@ -782,85 +955,30 @@ def cache_virus_memory(cache):
         VIRUS_MEMORY = dict(ordered[:VIRUS_MEMORY_MAX])
 
 
-def cache_scoring_invariants(cache):
-    """Cache arrays reused by every per-direction safety check.
-
-    This deliberately leaves score_move(), score_enemy_threat(), and
-    score_own_blob_virus() as per-direction calculations. It only avoids
-    rebuilding direction-independent masks and broadcast arrays 8-16 times
-    during the same tick.
-    """
-    own_rads = cache["own_rads"]
-    blob_rads = cache["blob_rads"]
-
-    if len(own_rads) and len(blob_rads):
-        danger_size = cache["enemy_danger_size"]
-        enemy_split_rads = cache["enemy_split_rads"]
-
-        cache["direct_danger_mask"] = (
-            danger_size[None, :] > own_rads[:, None] * DANGER_DIRECT_RATIO
-        )
-        cache["split_danger_mask"] = (
-            enemy_split_rads[None, :] > own_rads[:, None] * DANGER_SPLIT_RATIO
-        )
-        cache["danger_size_ratio"] = danger_size[None, :] / own_rads[:, None]
-    else:
-        cache["direct_danger_mask"] = None
-        cache["split_danger_mask"] = None
-        cache["danger_size_ratio"] = None
-
-    virus_rads = cache["virus_rads"]
-    if len(own_rads) and len(virus_rads):
-        cache["virus_dangerous_mask"] = (
-            own_rads[:, None] > virus_rads[None, :] * 1.1
-        )
-        cache["own_to_viruses"] = (
-            cache["virus_locs"][None, :, :] - cache["own_locs"][:, None, :]
-        )
-    else:
-        cache["virus_dangerous_mask"] = None
-        cache["own_to_viruses"] = None
-
-
 def cache_move_reports(cache, step_distance):
-    # Preserve the original per-direction scoring exactly. The optimisation is
-    # only that invariant arrays are cached once and report lists are built in
-    # one pass rather than rescanned afterwards.
+    # When we are already split, chase/virus farming are disabled and the
+    # expensive part is repeated safety checks over own pieces. 8 directions is
+    # enough for split-state navigation and saves a lot of late-game CPU.
     directions = DIRECTIONS_FAST if cache["own_blob_count"] > 1 else DIRECTIONS
 
-    reports = []
-    safe_reports = []
-    enemy_safe_reports = []
-    enemy_active = False
-    min_move = step_distance * 0.20
+    # v9 optimisation: score all directions in one batched/vectorized pass
+    # instead of looping and calling score_move() (and therefore NumPy) once
+    # per direction. Same formulas, same results, far fewer Python<->NumPy
+    # round trips per tick. This is the function that runs unconditionally
+    # every single tick, so its cost is what accumulates into the late-game
+    # cumulative timeout.
+    reports = score_moves_batch(cache, directions, step_distance, check_virus=True)
 
-    append_report = reports.append
-    append_safe = safe_reports.append
-    append_enemy_safe = enemy_safe_reports.append
-
-    for idx, direction in enumerate(directions):
-        dx = float(direction[0])
-        dy = float(direction[1])
-        report = score_move(cache, dx, dy, step_distance, check_virus=True)
-        report["idx"] = idx
-        report["dir"] = direction
-        report["dx"] = dx
-        report["dy"] = dy
-        append_report(report)
-
-        if report["enemy_active"]:
-            enemy_active = True
-
-        if report["actual_move"] >= min_move:
-            if report["safe"]:
-                append_safe(report)
-            if report["enemy_safe"]:
-                append_enemy_safe(report)
-
-    cache["enemy_active"] = enemy_active
+    cache["enemy_active"] = any(report["enemy_active"] for report in reports)
     cache["move_reports"] = reports
-    cache["safe_reports"] = safe_reports
-    cache["enemy_safe_reports"] = enemy_safe_reports
+    cache["safe_reports"] = [
+        report for report in reports
+        if report["safe"] and report["actual_move"] >= step_distance * 0.20
+    ]
+    cache["enemy_safe_reports"] = [
+        report for report in reports
+        if report["enemy_safe"] and report["actual_move"] >= step_distance * 0.20
+    ]
 
 
 def cache_frame(game):
@@ -873,7 +991,6 @@ def cache_frame(game):
         cache["blob_vels"] = np.zeros_like(cache["blob_locs"], dtype=float)
 
     cache_enemy(cache)
-    cache_scoring_invariants(cache)
     cache_virus_memory(cache)
 
     step_distance = STEP_DISTANCE_MULT * cache["player_radius"]
@@ -1060,12 +1177,18 @@ def food_blacklist(key):
         FOOD_TARGET_LAST_DIST = None
 
 
-def food_unreachable_corner(food_pos):
+def food_unreachable_corner(food_pos, player_radius=0.0):
+    # The fixed FOOD_CORNER_MARGIN only rules out food sitting right on the
+    # geometric corner point. For any real-sized blob that's not the region
+    # that actually restricts movement, so also scale the exclusion zone with
+    # how big we are: a bigger blob needs more clearance from both walls at
+    # once before a corner food item is worth detouring into a pocket for.
+    margin = max(FOOD_CORNER_MARGIN, player_radius * FOOD_CORNER_RADIUS_MULT)
     x, y = food_pos
-    near_left = x < FOOD_CORNER_MARGIN
-    near_right = ARENA_SIZE - x < FOOD_CORNER_MARGIN
-    near_bottom = y < FOOD_CORNER_MARGIN
-    near_top = ARENA_SIZE - y < FOOD_CORNER_MARGIN
+    near_left = x < margin
+    near_right = ARENA_SIZE - x < margin
+    near_bottom = y < margin
+    near_top = ARENA_SIZE - y < margin
     return (near_left or near_right) and (near_bottom or near_top)
 
 
@@ -1107,7 +1230,7 @@ def food_ranked_targets(cache):
 
     valid = dists > FOOD_MIN_TARGET_DIST
     for i, key in enumerate(food_keys):
-        if key in FOOD_BLACKLIST or food_unreachable_corner(food_locs[i]):
+        if key in FOOD_BLACKLIST or food_unreachable_corner(food_locs[i], cache["player_radius"]):
             valid[i] = False
 
     if not np.any(valid):
@@ -1205,6 +1328,11 @@ def override_escape(cache, step_distance):
             continue
 
         score = report["enemy_score"]
+        # Tiebreaker, not an override of safety: if two directions are
+        # similarly safe right now, prefer the one that doesn't run into a
+        # dead end. Weighted low enough that genuine danger avoidance always
+        # wins first.
+        score += CORNER_ESCAPE_WEIGHT * report["corner_score"]
         if report["actual_move"] < step_distance * 0.20:
             score -= DANGER_WALL_PUSH_PENALTY
         else:
