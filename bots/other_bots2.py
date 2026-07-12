@@ -83,7 +83,13 @@ DANGER_MOVE_REWARD = 5000.0
 EAT_RATIO = 1.12
 ENEMY_DANGER_WEIGHT = 14000.0
 ENEMY_HUNT_WEIGHT = 2500.0
-CHASE_RANGE_MULT = 7.0
+# Chase entry is deliberately tight while small. The previous fixed 7x-radius
+# gate effectively meant "chase anything visible" during the opening.
+CHASE_EARLY_RADIUS = 6.0
+CHASE_LATE_RADIUS = 14.0
+CHASE_EARLY_RANGE_MULT = 3.0
+CHASE_LATE_RANGE_MULT = 5.5
+CHASE_CONTINUE_RANGE_MULT = 1.20
 CHASE_LOCK_TICKS = 14
 CHASE_LOST_LIMIT = 8
 CHASE_LEAD_TICKS = 2.6
@@ -1229,6 +1235,29 @@ def enemy_near_wall(pos):
     return near_wall or near_corner
 
 
+def chase_entry_range_mult(player_radius):
+    """Scale chase willingness with our size.
+
+    Small opening blobs should farm reliable food instead of crossing the map
+    for the first edible enemy they see. As we become larger, the acceptable
+    chase radius rises smoothly because movement coverage and payoff improve.
+    """
+    if player_radius <= CHASE_EARLY_RADIUS:
+        return CHASE_EARLY_RANGE_MULT
+
+    if player_radius >= CHASE_LATE_RADIUS:
+        return CHASE_LATE_RANGE_MULT
+
+    progress = (
+        (player_radius - CHASE_EARLY_RADIUS)
+        / (CHASE_LATE_RADIUS - CHASE_EARLY_RADIUS)
+    )
+    return (
+        CHASE_EARLY_RANGE_MULT
+        + progress * (CHASE_LATE_RANGE_MULT - CHASE_EARLY_RANGE_MULT)
+    )
+
+
 def chase_block_point(enemy_pos, enemy_radius, player_radius, enemy_vel=None):
     """Point that cuts off the enemy's escape route.
 
@@ -1782,7 +1811,20 @@ def override_chase(cache, step_distance):
     player_radius = cache["player_radius"]
     blob_vels = cache.get("blob_vels")
 
-    in_range = edge_dists < player_radius * CHASE_RANGE_MULT
+    # Starting a chase is much stricter than before, especially early game.
+    # A currently locked target gets only a small continuation buffer so we do
+    # not abandon a genuinely close chase due to one noisy frame.
+    entry_mult = chase_entry_range_mult(player_radius)
+    in_range = edge_dists < player_radius * entry_mult
+
+    if CHASE_TARGET_KEY is not None:
+        locked_player = blob_player_ids == CHASE_TARGET_KEY
+        continuation_range = (
+            edge_dists
+            < player_radius * entry_mult * CHASE_CONTINUE_RANGE_MULT
+        )
+        in_range = in_range | (locked_player & continuation_range)
+
     candidates = edible & in_range
 
     if not np.any(candidates):
