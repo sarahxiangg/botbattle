@@ -1,4 +1,9 @@
-python3 benchmark.py -n 80 -p 0 -- \
-  uv run simulation \
-  1:bots/my_bot.py \
-  7:bots/other_bots2.py
+BOT_CONFIG="$(pwd)/configs/candidate_001.json" \
+python3 benchmark.py -n 8 -p 0 \
+--csv results/candidate_001.csv \
+--show-failures -- \
+uv run simulation \
+1:bots/my_bot.py \
+2:bots/other_bot.py \
+2:bots/other_bots.py \
+3:bots/other_bots2.py

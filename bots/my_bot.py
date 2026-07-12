@@ -4,6 +4,9 @@ from lib.interface.queries.query_move import QueryMovePlayer
 from lib.models.penguin_model import DirectionModel
 
 import numpy as np
+import json
+import os
+from pathlib import Path
 
 
 # =========================
@@ -167,6 +170,38 @@ VIRUS_MEMORY = {}
 VIRUS_TARGET_KEY = None
 VIRUS_TARGET_TICKS = 0
 
+
+#tunable constants
+TUNABLE_DEFAULTS = {
+    "TURN_WEIGHT": TURN_WEIGHT,
+    "FOOD_CLUSTER_WEIGHT": FOOD_CLUSTER_WEIGHT,
+    "FOOD_DISTANCE_POWER": FOOD_DISTANCE_POWER,
+    "CHASE_RANGE_MULT": CHASE_RANGE_MULT,
+    "CHASE_LEAD_TICKS": CHASE_LEAD_TICKS,
+    "CHASE_MIN_CLOSING_RATE": CHASE_MIN_CLOSING_RATE,
+    "CHASE_CLOSE_WEIGHT": CHASE_CLOSE_WEIGHT,
+    "CHASE_BLOCK_DIST_WEIGHT": CHASE_BLOCK_DIST_WEIGHT,
+    "CHASE_CENTER_SIDE_WEIGHT": CHASE_CENTER_SIDE_WEIGHT,
+    "SPLIT_RANGE_SAFETY_MULT": SPLIT_RANGE_SAFETY_MULT,
+    "VIRUS_FARM_MAX_RADIUS": VIRUS_FARM_MAX_RADIUS,
+}
+
+
+def load_tuning_config() -> None:
+    config_path = os.environ.get("BOT_CONFIG")
+
+    if not config_path:
+        return  # Use normal constants.
+
+    values = json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+    unknown = set(values) - set(TUNABLE_DEFAULTS)
+    if unknown:
+        raise ValueError(f"Unknown tuning parameters: {sorted(unknown)}")
+
+    for name, value in values.items():
+        default = TUNABLE_DEFAULTS[name]
+        globals()[name] = type(default)(value)
 
 # =========================
 # Basic helpers
@@ -2043,6 +2078,7 @@ def choose_direction(game: Game):
 # =========================
 
 def main() -> None:
+    load_tuning_config()
     game = Game()
 
     while True:
