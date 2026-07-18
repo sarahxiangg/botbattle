@@ -1,18 +1,28 @@
-for TRIAL in 0043 0046 0050
-do
-    echo
-    echo "=========================================="
-    echo "Benchmarking trial ${TRIAL}"
-    echo "=========================================="
+#!/usr/bin/env bash
+set -euo pipefail
 
-    CANDIDATE_CONFIG="$PWD/configs/trials_v4/trial_${TRIAL}.json" \
-    uv run benchmark.py \
-        -n 200 \
-        -p 0 \
-        --csv "results/final_200_${TRIAL}.csv" \
-        --show-failures \
-        -- \
-        uv run simulation --headless \
-        1:bots/_tuning_candidate.py \
-        7:bots/other_bots2.py
-done
+HOURS="${HOURS:-12}"
+ROOT="${ROOT:-$PWD}"
+
+if [[ ! -f "$ROOT/bots/my_bot.py" ]]; then
+    echo "Missing $ROOT/bots/my_bot.py"
+    echo "Copy clean_bot.py there before starting the optimiser."
+    exit 1
+fi
+
+uv run --with optuna "$ROOT/optimise.py" \
+    --root "$ROOT" \
+    --hours "$HOURS" \
+    --candidate-module my_bot \
+    --results-dir results/clean_tuning \
+    --stage1-strongest 4 \
+    --stage1-mixed 2 \
+    --stage2-strongest 8 \
+    --stage2-mixed 3 \
+    --finalists 5 \
+    --final-strongest 30 \
+    --final-mixed 10
+
+echo
+echo "Best validated configuration:"
+echo "$ROOT/results/clean_tuning/best_validated_config.json"

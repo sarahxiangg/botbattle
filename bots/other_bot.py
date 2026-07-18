@@ -12,6 +12,13 @@ from lib.models.penguin_model import DirectionModel
 
 TAU = 2.0 * math.pi
 
+# Hard per-turn budgets. The original implementation clustered every visible
+# food item (quadratic work) and compared every enemy with every owned blob.
+# Nearest objects are the only ones that can affect the next decision.
+MAX_FOOD_CONSIDERED = 28
+MAX_BLOBS_CONSIDERED = 20
+MAX_VIRUSES_CONSIDERED = 10
+
 FOOD_CLUSTER_RADIUS_MULT = 2.0
 FOOD_VALUE_WEIGHT = 6.0
 PREY_VALUE_WEIGHT = 3.0
@@ -106,6 +113,16 @@ class _Ctx:
 
 def _pos(obj) -> np.ndarray:
     return np.array(obj.pos, dtype=float)
+
+
+def _nearest(objects: list, origin: np.ndarray, limit: int) -> list:
+    if len(objects) <= limit:
+        return objects
+    ox, oy = float(origin[0]), float(origin[1])
+    return sorted(
+        objects,
+        key=lambda obj: (float(obj.pos[0]) - ox) ** 2 + (float(obj.pos[1]) - oy) ** 2,
+    )[:limit]
 
 
 def _radius(obj, default: float = 1.0) -> float:
@@ -720,11 +737,17 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
     round_frac = cur_round / max(1, max_rounds)
     arena_size = float(getattr(game.state.map, "size", 0) or 0)
 
-    visible_blobs = list(game.state.visible_blobs or [])
-    visible_food = list(game.state.visible_food or [])
-    visible_viruses = list(game.state.visible_viruses or [])
     player_pos = np.array([me.x, me.y], dtype=float)
     player_radius = _radius(me)
+    visible_blobs = _nearest(
+        list(game.state.visible_blobs or []), player_pos, MAX_BLOBS_CONSIDERED
+    )
+    visible_food = _nearest(
+        list(game.state.visible_food or []), player_pos, MAX_FOOD_CONSIDERED
+    )
+    visible_viruses = _nearest(
+        list(game.state.visible_viruses or []), player_pos, MAX_VIRUSES_CONSIDERED
+    )
 
     ctx = _Ctx(
         player_id=me.player_id,

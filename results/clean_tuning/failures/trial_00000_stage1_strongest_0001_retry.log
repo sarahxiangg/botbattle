@@ -1,0 +1,175 @@
+Error: Opponent timeout: [6]
+Workspace: /home/arianghojavand/botbattle/results/clean_tuning/workspaces/trial_00000_stage1/strongest/slot_001_attempt_001
+Command: uv run simulation --headless --workspace /home/arianghojavand/botbattle/results/clean_tuning/workspaces/trial_00000_stage1/strongest/slot_001_attempt_001 1:bots/_tuning_candidate.py 7:bots/other_bots2.py
+
+[visualiser-launcher] started submission 0 (pid=1136801).
+[visualiser-launcher] started submission 1 (pid=1136802).
+[visualiser-launcher] started submission 2 (pid=1136803).
+[visualiser-launcher] started submission 3 (pid=1136804).
+[visualiser-launcher] started submission 4 (pid=1136805).
+[visualiser-launcher] started submission 5 (pid=1136806).
+[visualiser-launcher] started submission 6 (pid=1136807).
+[visualiser-launcher] started submission 7 (pid=1136808).
+[visualiser-launcher] delaying engine start for 3s countdown.
+[visualiser-launcher] started engine.
+Intialising game engine!
+New round 0
+New round 1
+New round 2
+New round 3
+New round 4
+New round 5
+New round 6
+New round 7
+New round 8
+New round 9
+New round 10
+New round 11
+New round 12
+New round 13
+New round 14
+New round 15
+New round 16
+New round 17
+New round 18
+New round 19
+New round 20
+New round 21
+New round 22
+New round 23
+New round 24
+New round 25
+New round 26
+New round 27
+New round 28
+New round 29
+New round 30
+New round 31
+New round 32
+New round 33
+New round 34
+New round 35
+New round 36
+New round 37
+New round 38
+New round 39
+New round 40
+New round 41
+New round 42
+New round 43
+New round 44
+New round 45
+New round 46
+New round 47
+New round 48
+New round 49
+New round 50
+New round 51
+New round 52
+New round 53
+New round 54
+New round 55
+New round 56
+New round 57
+New round 58
+New round 59
+New round 60
+New round 61
+New round 62
+New round 63
+New round 64
+New round 65
+New round 66
+New round 67
+New round 68
+New round 69
+New round 70
+New round 71
+New round 72
+New round 73
+New round 74
+New round 75
+New round 76
+New round 77
+New round 78
+New round 79
+New round 80
+New round 81
+New round 82
+New round 83
+New round 84
+New round 85
+New round 86
+New round 87
+New round 88
+New round 89
+New round 90
+New round 91
+New round 92
+New round 93
+New round 94
+New round 95
+New round 96
+New round 97
+New round 98
+New round 99
+New round 100
+New round 101
+New round 102
+New round 103
+New round 104
+New round 105
+New round 106
+New round 107
+New round 108
+New round 109
+New round 110
+New round 111
+New round 112
+New round 113
+New round 114
+New round 115
+New round 116
+New round 117
+New round 118
+New round 119
+New round 120
+New round 121
+New round 122
+New round 123
+New round 124
+New round 125
+New round 126
+New round 127
+New round 128
+New round 129
+New round 130
+New round 131
+New round 132
+New round 133
+New round 134
+New round 135
+New round 136
+New round 137
+New round 138
+New round 139
+New round 140
+New round 141
+New round 142
+New round 143
+New round 144
+New round 145
+New round 146
+New round 147
+New round 148
+[engine]: match complete, outcome was {result_type='PLAYER_BANNED' ban_type='CUMULATIVE_TIMEOUT' player=6 reason='You took too long to respond.'}
+[visualiser-launcher] engine terminated.
+[visualiser-launcher] leaving visualiser pid 1136801 running for the end screen.
+[visualiser-launcher] terminated submission pid 1136802.
+[visualiser-launcher] terminated submission pid 1136803.
+[visualiser-launcher] terminated submission pid 1136804.
+[visualiser-launcher] terminated submission pid 1136805.
+[visualiser-launcher] terminated submission pid 1136806.
+[visualiser-launcher] terminated submission pid 1136807.
+[visualiser-launcher] terminated submission pid 1136808.
+

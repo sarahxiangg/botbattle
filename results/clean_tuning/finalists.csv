@@ -1,0 +1,6 @@
+place,trial,search_fitness,validation_expected_mass,strongest_expected_mass,mixed_expected_mass,failures,matches,config
+4,107,33.782249219308895,28.683930396249014,24.627647624565878,40.85277871129843,0,40,/home/arianghojavand/botbattle/results/clean_tuning/configs/trial_00107.json
+3,64,34.43947319418716,25.10533522746242,20.84775084530062,37.87808837394781,0,40,/home/arianghojavand/botbattle/results/clean_tuning/configs/trial_00064.json
+2,130,35.452092054262536,13.676615024313106,12.580396293217493,16.96527121759994,0,40,/home/arianghojavand/botbattle/results/clean_tuning/configs/trial_00130.json
+5,165,33.25063717989853,12.033891541002212,13.057481942862507,8.963120335421326,0,40,/home/arianghojavand/botbattle/results/clean_tuning/configs/trial_00165.json
+1,12,35.54185850577154,10.82844552061039,10.255189507255023,12.548213560676498,0,40,/home/arianghojavand/botbattle/results/clean_tuning/configs/trial_00012.json

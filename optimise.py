@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+"""Resumable multi-fidelity optimiser for clean_bot.py.
+
+Primary objective: expected final mass. Failed matches contribute zero mass.
+Rank, median, win rate, and timeouts are recorded only as diagnostics.
+"""
+
 from __future__ import annotations
 
+import argparse
+import ast
+import csv
 import json
-import math
 import os
 import re
 import shutil
@@ -10,137 +18,139 @@ import signal
 import statistics
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import optuna
 
-from benchmark import parse_outcome
 
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+RESULT_TYPE_RE = re.compile(r"result_type=['\"]([^'\"]+)['\"]")
+RANKING_RE = re.compile(r"ranking=(\[[^\]]*\])")
+MASSES_RE = re.compile(r"final_masses=(\{[^}]*\})")
 
-# ============================================================
-# Paths
-# ============================================================
-
-ROOT = Path(__file__).resolve().parent
-
-CONFIG_DIR = ROOT / "configs" / "trials_v4"
-RESULTS_DIR = ROOT / "results"
-WORKSPACE_DIR = RESULTS_DIR / "workspaces_v4"
-FAILURE_DIR = RESULTS_DIR / "failures_v4"
-
-CANDIDATE_WRAPPER = ROOT / "bots" / "_tuning_candidate.py"
-
-for directory in (
-    CONFIG_DIR,
-    RESULTS_DIR,
-    WORKSPACE_DIR,
-    FAILURE_DIR,
-):
-    directory.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# Optimisation settings
-# ============================================================
-
-STRONGEST_MATCHES = 8
-MIXED_MATCHES = 4
-MATCHES_PER_TRIAL = STRONGEST_MATCHES + MIXED_MATCHES
-
-NUMBER_OF_TRIALS = 60
-MATCH_TIMEOUT_SECONDS = 180
-MAX_ATTEMPTS_MULTIPLIER = 3
-
-KEEP_SUCCESSFUL_WORKSPACES = False
-PLAYER_ID = 0
-
-DATABASE_PATH = RESULTS_DIR / "optuna_v4.db"
-STUDY_NAME = "bot_tuning_v4"
-
-
-# Candidate receives the trial config through a small wrapper. Opponents do not
-# read CANDIDATE_CONFIG, so they remain fixed during optimisation.
-STRONGEST_BOT_ARGUMENTS = [
-    "1:bots/_tuning_candidate.py",
-    "7:bots/other_bots2.py",
-]
-
-MIXED_BOT_ARGUMENTS = [
-    "1:bots/_tuning_candidate.py",
-    "2:bots/other_bot.py",
-    "2:bots/other_bots.py",
-    "3:bots/other_bots2.py",
-]
-
-
-# Original Trial 0000 / submitted baseline.
-BASELINE_CONFIG: dict[str, float] = {
-    "TURN_WEIGHT": 80.0,
-    "FOOD_CLUSTER_WEIGHT": 0.55,
-    "FOOD_DISTANCE_POWER": 1.15,
-    "DANGER_OVERRIDE_RANGE_MULT": 9.0,
-    "DANGER_DIRECT_RATIO": 1.06,
-    "CHASE_RANGE_MULT": 7.0,
-    "CHASE_LEAD_TICKS": 2.6,
-    "CHASE_MIN_CLOSING_RATE": -1.25,
-    "CHASE_CLOSE_WEIGHT": 24.0,
-    "SPLIT_RANGE_SAFETY_MULT": 0.75,
-    "SPLIT_TARGET_MIN_RADIUS_MULT": 0.16,
-    "VIRUS_FARM_MAX_RADIUS": 18.0,
+ORDER_PROFILES = {
+    "escape_first": ["escape", "unstuck", "split", "chase", "virus", "food"],
+    "split_first": ["split", "escape", "unstuck", "chase", "virus", "food"],
+    "escape_then_split": ["escape", "split", "unstuck", "chase", "virus", "food"],
+    "virus_before_chase": ["escape", "unstuck", "split", "virus", "chase", "food"],
 }
 
 
-# Best configuration from the first Optuna run.
-TRIAL_17_CONFIG: dict[str, float] = {
-    "TURN_WEIGHT": 56.519876630868445,
-    "FOOD_CLUSTER_WEIGHT": 0.55,
-    "FOOD_DISTANCE_POWER": 1.15,
-    "DANGER_OVERRIDE_RANGE_MULT": 9.0,
-    "DANGER_DIRECT_RATIO": 1.06,
-    "CHASE_RANGE_MULT": 6.219934902522074,
-    "CHASE_LEAD_TICKS": 2.924711670693439,
-    "CHASE_MIN_CLOSING_RATE": -1.25,
-    "CHASE_CLOSE_WEIGHT": 39.90857652982805,
-    "SPLIT_RANGE_SAFETY_MULT": 0.7631787944167937,
-    "SPLIT_TARGET_MIN_RADIUS_MULT": 0.16,
-    "VIRUS_FARM_MAX_RADIUS": 21.559608057655243,
-}
+@dataclass
+class MatchSet:
+    masses: list[float] = field(default_factory=list)
+    ranks: list[int] = field(default_factory=list)
+    failures: int = 0
+    elapsed_seconds: float = 0.0
+
+    @property
+    def scheduled(self) -> int:
+        return len(self.masses) + self.failures
+
+    def extend(self, other: "MatchSet") -> None:
+        self.masses.extend(other.masses)
+        self.ranks.extend(other.ranks)
+        self.failures += other.failures
+        self.elapsed_seconds += other.elapsed_seconds
 
 
-# ============================================================
-# Candidate wrapper
-# ============================================================
-
-def ensure_candidate_wrapper() -> None:
-    """Create the wrapper that applies BOT_CONFIG only to player 0."""
-    wrapper_source = '''import os
-
-config_path = os.environ.get("CANDIDATE_CONFIG")
-if not config_path:
-    raise RuntimeError("CANDIDATE_CONFIG was not provided")
-
-os.environ["BOT_CONFIG"] = config_path
-
-from my_bot import main
-
-if __name__ == "__main__":
-    main()
-'''
-
-    CANDIDATE_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
-    CANDIDATE_WRAPPER.write_text(
-        wrapper_source,
-        encoding="utf-8",
-    )
+def parse_outcome(output: str, player_id: int) -> tuple[float, int]:
+    clean = ANSI_ESCAPE.sub("", output)
+    lines = [
+        line for line in clean.splitlines()
+        if "match complete" in line and "ranking=" in line and "final_masses=" in line
+    ]
+    if not lines:
+        raise ValueError("No completed-match outcome line found")
+    line = lines[-1]
+    result_match = RESULT_TYPE_RE.search(line)
+    if result_match and result_match.group(1) != "SUCCESS":
+        raise ValueError(f"Result was {result_match.group(1)!r}, not SUCCESS")
+    ranking_match = RANKING_RE.search(line)
+    masses_match = MASSES_RE.search(line)
+    if ranking_match is None or masses_match is None:
+        raise ValueError("Could not parse ranking or final_masses")
+    ranking = [int(value) for value in ast.literal_eval(ranking_match.group(1))]
+    masses = ast.literal_eval(masses_match.group(1))
+    mass = masses.get(player_id, masses.get(str(player_id)))
+    if player_id not in ranking or mass is None:
+        raise ValueError(f"Player {player_id} missing from result")
+    return float(mass), ranking.index(player_id) + 1
 
 
-# ============================================================
-# Process execution
-# ============================================================
+def extract_result(payload: Any, player_id: int) -> tuple[float, int] | None:
+    if isinstance(payload, list):
+        for item in reversed(payload):
+            parsed = extract_result(item, player_id)
+            if parsed is not None:
+                return parsed
+        return None
+    if not isinstance(payload, dict):
+        return None
+    ranking = payload.get("ranking")
+    masses = payload.get("final_masses")
+    if ranking is not None and isinstance(masses, dict):
+        ranking = [int(value) for value in ranking]
+        mass = masses.get(player_id, masses.get(str(player_id)))
+        if player_id in ranking and mass is not None:
+            result_type = payload.get("result_type")
+            if result_type is not None and str(result_type) != "SUCCESS":
+                raise ValueError(f"Result was {result_type!r}, not SUCCESS")
+            return float(mass), ranking.index(player_id) + 1
+    for key in ("result", "match_result", "data", "payload", "output"):
+        if key in payload:
+            parsed = extract_result(payload[key], player_id)
+            if parsed is not None:
+                return parsed
+    return None
 
-def kill_process_group(process: subprocess.Popen[str]) -> None:
-    """Kill the simulation launcher and any children it left running."""
+
+def parse_workspace_result(workspace: Path, output: str, player_id: int) -> tuple[float, int]:
+    # The normal simulator path prints the complete result to stdout. Parse it
+    # immediately so successful matches do not spend two seconds polling the
+    # workspace. JSON is a fallback for engine variants without that line.
+    try:
+        return parse_outcome(output, player_id)
+    except ValueError:
+        pass
+
+    names = {"results.json", "result.json", "match_result.json", "match-results.json"}
+    deadline = time.monotonic() + 2.0
+    files: list[Path] = []
+    while time.monotonic() < deadline:
+        files = sorted(
+            (path for path in workspace.rglob("*.json") if path.name in names),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if files:
+            break
+        time.sleep(0.1)
+    for path in files:
+        try:
+            parsed = extract_result(json.loads(path.read_text(encoding="utf-8")), player_id)
+            if parsed is not None:
+                return parsed
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    raise ValueError("No completed-match outcome found in stdout or workspace")
+
+
+def timed_out_players(output: str) -> set[int]:
+    players: set[int] = set()
+    for line in output.splitlines():
+        upper = line.upper()
+        if "CUMULATIVE_TIMEOUT" not in upper and "PLAYER_BANNED" not in upper:
+            continue
+        match = re.search(r"player(?:_id)?\s*[:=]\s*(\d+)", line, re.I)
+        if match:
+            players.add(int(match.group(1)))
+    return players
+
+
+def kill_group(process: subprocess.Popen[str]) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -150,789 +160,441 @@ def kill_process_group(process: subprocess.Popen[str]) -> None:
             pass
 
 
-def run_simulation(
-    command: list[str],
-    environment: dict[str, str],
-) -> tuple[int, str]:
-    """Run one match and clean up every process created for it."""
+def run_process(command: list[str], cwd: Path, environment: dict[str, str], timeout: float) -> tuple[int, str]:
     process = subprocess.Popen(
         command,
-        cwd=ROOT,
+        cwd=cwd,
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
-
-    timed_out = False
-
     try:
-        stdout, stderr = process.communicate(
-            timeout=MATCH_TIMEOUT_SECONDS,
-        )
-
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        timed_out = True
-        kill_process_group(process)
+        kill_group(process)
         stdout, stderr = process.communicate()
-
+        raise RuntimeError(f"Simulation exceeded {timeout:.0f}s\n{stdout[-3000:]}\n{stderr[-3000:]}")
     finally:
-        # Some launcher versions intentionally leave a process alive for an end
-        # screen, even in headless mode.
-        kill_process_group(process)
-
-    combined_output = (
-        (stdout or "")
-        + "\n"
-        + (stderr or "")
-    )
-
-    if timed_out:
-        raise RuntimeError(
-            f"Simulation timed out after "
-            f"{MATCH_TIMEOUT_SECONDS} seconds.\n"
-            f"{combined_output[-5000:]}"
-        )
-
-    return process.returncode, combined_output
+        kill_group(process)
+    return process.returncode, (stdout or "") + "\n" + (stderr or "")
 
 
-# ============================================================
-# Result parsing
-# ============================================================
-
-def extract_result_from_mapping(
-    result: dict[str, Any],
-    player_id: int,
-) -> tuple[float, int] | None:
-    ranking = result.get("ranking")
-    masses = result.get("final_masses")
-
-    if ranking is None or masses is None:
-        return None
-
-    result_type = result.get("result_type")
-    if result_type is not None and str(result_type) != "SUCCESS":
-        raise ValueError(
-            f"Match result was {result_type!r}, not SUCCESS."
-        )
-
-    ranking_as_ints = [int(value) for value in ranking]
-
-    if player_id not in ranking_as_ints:
-        raise ValueError(
-            f"Player {player_id} missing from ranking."
-        )
-
-    mass_value = None
-    if isinstance(masses, dict):
-        mass_value = masses.get(player_id)
-        if mass_value is None:
-            mass_value = masses.get(str(player_id))
-
-    if mass_value is None:
-        raise ValueError(
-            f"Player {player_id} missing from final_masses."
-        )
-
-    rank = ranking_as_ints.index(player_id) + 1
-    return float(mass_value), rank
+def expected_mass(results: MatchSet) -> float:
+    """Failures are zero-mass games, matching the actual tournament outcome."""
+    return sum(results.masses) / max(results.scheduled, 1)
 
 
-def extract_result_from_payload(
-    payload: Any,
-    player_id: int,
-) -> tuple[float, int] | None:
-    if isinstance(payload, list):
-        for item in reversed(payload):
-            parsed = extract_result_from_payload(
-                item,
-                player_id,
-            )
-            if parsed is not None:
-                return parsed
-        return None
-
-    if not isinstance(payload, dict):
-        return None
-
-    direct = extract_result_from_mapping(
-        payload,
-        player_id,
-    )
-    if direct is not None:
-        return direct
-
-    for key in (
-        "result",
-        "match_result",
-        "data",
-        "payload",
-        "output",
-    ):
-        nested = payload.get(key)
-        if nested is None:
-            continue
-
-        parsed = extract_result_from_payload(
-            nested,
-            player_id,
-        )
-        if parsed is not None:
-            return parsed
-
-    return None
-
-
-def find_result_files(workspace: Path) -> list[Path]:
-    filenames = {
-        "results.json",
-        "result.json",
-        "match_result.json",
-        "match-results.json",
-    }
-
-    found = [
-        path
-        for path in workspace.rglob("*.json")
-        if path.name in filenames
-    ]
-
-    return sorted(
-        found,
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-
-
-def parse_workspace_result(
-    workspace: Path,
-    output: str,
-    player_id: int,
-) -> tuple[float, int]:
-    """Prefer a result JSON file and fall back to terminal output."""
-    deadline = time.monotonic() + 2.0
-
-    while time.monotonic() < deadline:
-        result_files = find_result_files(workspace)
-        if result_files:
-            break
-        time.sleep(0.1)
-    else:
-        result_files = []
-
-    errors: list[str] = []
-
-    for result_path in result_files:
-        try:
-            payload = json.loads(
-                result_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                )
-            )
-
-            parsed = extract_result_from_payload(
-                payload,
-                player_id,
-            )
-            if parsed is not None:
-                return parsed
-
-        except (OSError, json.JSONDecodeError, ValueError) as error:
-            errors.append(
-                f"{result_path}: {error}"
-            )
-
-    try:
-        return parse_outcome(output, player_id)
-
-    except ValueError as stdout_error:
-        details = "\n".join(errors)
-
-        raise ValueError(
-            "No valid completed-match result was found.\n"
-            f"JSON errors:\n{details or 'None'}\n"
-            f"Stdout parser error: {stdout_error}"
-        ) from stdout_error
-
-
-# ============================================================
-# Timeout / ban detection
-# ============================================================
-
-def cumulative_timeout_players(output: str) -> set[int]:
-    """Return player IDs mentioned on cumulative-timeout/ban lines."""
-    players: set[int] = set()
-
-    for line in output.splitlines():
-        upper = line.upper()
-
-        if (
-            "CUMULATIVE_TIMEOUT" not in upper
-            and "PLAYER_BANNED" not in upper
-        ):
-            continue
-
-        match = re.search(
-            r"player(?:_id)?\s*[:=]\s*(\d+)",
-            line,
-            flags=re.IGNORECASE,
-        )
-
-        if match:
-            players.add(int(match.group(1)))
-
-    return players
-
-
-class OpponentTimeoutError(RuntimeError):
-    pass
-
-
-class CandidateTimeoutError(RuntimeError):
-    pass
-
-
-# ============================================================
-# Failure diagnostics
-# ============================================================
-
-def save_failure_log(
-    trial_name: str,
-    lineup_name: str,
-    match_number: int,
-    attempt_number: int,
-    command: list[str],
-    workspace: Path,
-    output: str,
-    error: Exception,
-) -> Path:
-    log_path = (
-        FAILURE_DIR
-        / (
-            f"{trial_name}_{lineup_name}"
-            f"_match_{match_number:03d}"
-            f"_attempt_{attempt_number:03d}.log"
-        )
-    )
-
-    log_path.write_text(
-        "\n".join([
-            f"Error: {error}",
-            "",
-            f"Workspace: {workspace}",
-            "",
-            "Command:",
-            " ".join(command),
-            "",
-            "Simulation output:",
-            output,
-        ]),
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    return log_path
-
-
-# ============================================================
-# Fitness
-# ============================================================
-
-def summarise_results(
-    masses: list[float],
-    ranks: list[int],
-    failures: int,
-    total_matches: int,
-) -> dict[str, float]:
-    if not ranks:
-        return {
-            "fitness": -999.0,
-            "average_rank": 8.0,
-            "median_mass": 0.0,
-            "average_mass": 0.0,
-            "win_rate": 0.0,
-            "top_three_rate": 0.0,
-            "failure_rate": 1.0,
-        }
-
-    successful = len(ranks)
-
-    average_rank = statistics.fmean(ranks)
-    median_mass = statistics.median(masses)
-    average_mass = statistics.fmean(masses)
-
-    win_rate = (
-        sum(rank == 1 for rank in ranks)
-        / successful
-    )
-
-    top_three_rate = (
-        sum(rank <= 3 for rank in ranks)
-        / successful
-    )
-
-    failure_rate = failures / total_matches
-
-    rank_score = (8.0 - average_rank) / 7.0
-
-    mass_score = min(
-        math.log1p(median_mass)
-        / math.log1p(50.0),
-        1.5,
-    )
-
-    fitness = (
-        0.90 * average_mass
-        + 0.10 * median_mass
-    )
-
+def summary(results: MatchSet) -> dict[str, float]:
+    scheduled = max(results.scheduled, 1)
+    successes = len(results.masses)
+    ranks = results.ranks
     return {
-        "fitness": float(fitness),
-        "average_rank": float(average_rank),
-        "median_mass": float(median_mass),
-        "average_mass": float(average_mass),
-        "win_rate": float(win_rate),
-        "top_three_rate": float(top_three_rate),
-        "failure_rate": float(failure_rate),
+        "expected_mass": expected_mass(results),
+        "successful_average_mass": statistics.fmean(results.masses) if results.masses else 0.0,
+        "median_mass": statistics.median(results.masses) if results.masses else 0.0,
+        "maximum_mass": max(results.masses, default=0.0),
+        "average_rank": statistics.fmean(ranks) if ranks else 8.0,
+        "win_rate": sum(rank == 1 for rank in ranks) / scheduled,
+        "top_three_rate": sum(rank <= 3 for rank in ranks) / scheduled,
+        "failure_rate": results.failures / scheduled,
+        "matches": float(results.scheduled),
+        "elapsed_seconds": results.elapsed_seconds,
     }
 
 
-# ============================================================
-# Candidate evaluation
-# ============================================================
+def combined_fitness(strongest: MatchSet, mixed: MatchSet) -> float:
+    # Average final mass is the objective. The lineup weighting is explicit so
+    # changes to match counts do not silently change what the study optimises.
+    return 0.75 * expected_mass(strongest) + 0.25 * expected_mass(mixed)
 
-def evaluate_lineup(
-    config_path: Path,
-    bot_arguments: list[str],
-    match_count: int,
-    lineup_name: str,
-    environment: dict[str, str],
-) -> dict[str, Any]:
-    masses: list[float] = []
-    ranks: list[int] = []
-    failures = 0
 
-    trial_name = config_path.stem
-    completed_slots = 0
-    attempt_number = 0
-    max_attempts = max(
-        match_count,
-        match_count * MAX_ATTEMPTS_MULTIPLIER,
-    )
+def suggest_config(trial: optuna.Trial) -> dict[str, Any]:
+    order_profile = trial.suggest_categorical("ORDER_PROFILE", list(ORDER_PROFILES))
+    return {
+        "OVERRIDE_ORDER": ORDER_PROFILES[order_profile],
+        "NUM_DIRECTIONS": trial.suggest_categorical("NUM_DIRECTIONS", [12, 16]),
+        "MAX_ENEMIES": trial.suggest_categorical("MAX_ENEMIES", [18, 21, 24]),
+        "SAFETY_OWN_PIECES": trial.suggest_categorical("SAFETY_OWN_PIECES", [2, 3]),
+        "STEP_RADIUS_MULT": trial.suggest_float("STEP_RADIUS_MULT", 1.25, 1.75),
 
-    while (
-        completed_slots < match_count
-        and attempt_number < max_attempts
-    ):
-        attempt_number += 1
-        match_number = completed_slots + 1
+        "SPLIT_REACH_RELIABILITY": trial.suggest_float("SPLIT_REACH_RELIABILITY", 0.62, 0.90),
+        "ESCAPE_DIRECT_RANGE_MULT": trial.suggest_float("ESCAPE_DIRECT_RANGE_MULT", 3.5, 8.0),
+        "ESCAPE_SPLIT_REACH_BUFFER": trial.suggest_float("ESCAPE_SPLIT_REACH_BUFFER", 0.92, 1.16),
+        "ESCAPE_MOVE_WEIGHT": trial.suggest_float("ESCAPE_MOVE_WEIGHT", 80.0, 320.0, log=True),
+        "ESCAPE_WALL_WEIGHT": trial.suggest_float("ESCAPE_WALL_WEIGHT", 100.0, 650.0, log=True),
+        "ESCAPE_VIRUS_SHIELD_WEIGHT": trial.suggest_float("ESCAPE_VIRUS_SHIELD_WEIGHT", 150.0, 1400.0, log=True),
+        "ESCAPE_HARD_MARGIN": trial.suggest_float("ESCAPE_HARD_MARGIN", 0.0, 0.40),
 
-        workspace = (
-            WORKSPACE_DIR
-            / trial_name
-            / lineup_name
-            / (
-                f"match_{match_number:03d}"
-                f"_attempt_{attempt_number:03d}"
-            )
+        "SPLIT_CAPTURE_WEIGHT": trial.suggest_float("SPLIT_CAPTURE_WEIGHT", 3.0, 15.0, log=True),
+        "SPLIT_DEPTH_COST": trial.suggest_float("SPLIT_DEPTH_COST", 0.5, 7.0, log=True),
+        "SPLIT_FRAGMENT_COST": trial.suggest_float("SPLIT_FRAGMENT_COST", 0.02, 0.65, log=True),
+        "SPLIT_EXTERNAL_RISK_WEIGHT": trial.suggest_float("SPLIT_EXTERNAL_RISK_WEIGHT", 0.15, 3.5, log=True),
+        "SPLIT_MIN_UTILITY": trial.suggest_float("SPLIT_MIN_UTILITY", -2.0, 10.0),
+        "SPLIT_LARGER_OWNER_RATIO": trial.suggest_float("SPLIT_LARGER_OWNER_RATIO", 0.95, 1.30),
+        "SPLIT_PLAN_WAIT_TICKS": trial.suggest_int("SPLIT_PLAN_WAIT_TICKS", 1, 9),
+
+        "CHASE_ACQUIRE_RANGE_MULT": trial.suggest_float("CHASE_ACQUIRE_RANGE_MULT", 4.0, 14.0),
+        "CHASE_DIRECT_RANGE_MULT": trial.suggest_float("CHASE_DIRECT_RANGE_MULT", 1.5, 5.0),
+        "CHASE_MAX_INTERCEPT_TICKS": trial.suggest_float("CHASE_MAX_INTERCEPT_TICKS", 5.0, 18.0),
+        "CHASE_LOCK_TICKS": trial.suggest_int("CHASE_LOCK_TICKS", 30, 240, log=True),
+        "CHASE_WALL_HORIZON": trial.suggest_float("CHASE_WALL_HORIZON", 14.0, 42.0),
+        "CHASE_BLOCK_OFFSET_MULT": trial.suggest_float("CHASE_BLOCK_OFFSET_MULT", 0.25, 1.50),
+        "CHASE_DISTANCE_WEIGHT": trial.suggest_float("CHASE_DISTANCE_WEIGHT", 0.05, 1.0, log=True),
+        "CHASE_ETA_WEIGHT": trial.suggest_float("CHASE_ETA_WEIGHT", 0.25, 6.0, log=True),
+        "CHASE_LOCK_BONUS": trial.suggest_float("CHASE_LOCK_BONUS", 4.0, 50.0, log=True),
+        "CHASE_VELOCITY_NEW_WEIGHT": trial.suggest_float("CHASE_VELOCITY_NEW_WEIGHT", 0.20, 0.85),
+
+        "VIRUS_ENEMY_RANGE_MULT": trial.suggest_float("VIRUS_ENEMY_RANGE_MULT", 2.0, 9.0),
+        "VIRUS_MANUAL_SPLIT_TIME_BONUS": trial.suggest_float("VIRUS_MANUAL_SPLIT_TIME_BONUS", 0.5, 8.0, log=True),
+        "VIRUS_MANUAL_SPLIT_RISK_COST": trial.suggest_float("VIRUS_MANUAL_SPLIT_RISK_COST", 0.25, 8.0, log=True),
+        "VIRUS_MAX_FARM_MASS": trial.suggest_float("VIRUS_MAX_FARM_MASS", 45.0, 350.0, log=True),
+
+        "FOOD_CLUSTER_RADIUS": trial.suggest_float("FOOD_CLUSTER_RADIUS", 2.5, 7.0),
+        "FOOD_CLUSTER_WEIGHT": trial.suggest_float("FOOD_CLUSTER_WEIGHT", 0.25, 3.0, log=True),
+        "FOOD_DISTANCE_POWER": trial.suggest_float("FOOD_DISTANCE_POWER", 0.75, 2.25),
+        "FOOD_LOCK_TICKS": trial.suggest_int("FOOD_LOCK_TICKS", 3, 30),
+        "ROAM_CENTER_WEIGHT": trial.suggest_float("ROAM_CENTER_WEIGHT", 0.15, 3.0, log=True),
+        "ROAM_MOMENTUM_WEIGHT": trial.suggest_float("ROAM_MOMENTUM_WEIGHT", 0.05, 1.5, log=True),
+    }
+
+
+DEFAULT_TRIAL = {
+    "ORDER_PROFILE": "escape_first",
+    "NUM_DIRECTIONS": 16,
+    "MAX_ENEMIES": 24,
+    "SAFETY_OWN_PIECES": 3,
+    "STEP_RADIUS_MULT": 1.50,
+    "SPLIT_REACH_RELIABILITY": 0.76,
+    "ESCAPE_DIRECT_RANGE_MULT": 6.0,
+    "ESCAPE_SPLIT_REACH_BUFFER": 1.05,
+    "ESCAPE_MOVE_WEIGHT": 180.0,
+    "ESCAPE_WALL_WEIGHT": 300.0,
+    "ESCAPE_VIRUS_SHIELD_WEIGHT": 650.0,
+    "ESCAPE_HARD_MARGIN": 0.15,
+    "SPLIT_CAPTURE_WEIGHT": 8.0,
+    "SPLIT_DEPTH_COST": 2.5,
+    "SPLIT_FRAGMENT_COST": 0.18,
+    "SPLIT_EXTERNAL_RISK_WEIGHT": 1.25,
+    "SPLIT_MIN_UTILITY": 2.0,
+    "SPLIT_LARGER_OWNER_RATIO": 1.02,
+    "SPLIT_PLAN_WAIT_TICKS": 5,
+    "CHASE_ACQUIRE_RANGE_MULT": 8.0,
+    "CHASE_DIRECT_RANGE_MULT": 3.0,
+    "CHASE_MAX_INTERCEPT_TICKS": 12.0,
+    "CHASE_LOCK_TICKS": 160,
+    "CHASE_WALL_HORIZON": 30.0,
+    "CHASE_BLOCK_OFFSET_MULT": 0.8,
+    "CHASE_DISTANCE_WEIGHT": 0.30,
+    "CHASE_ETA_WEIGHT": 2.0,
+    "CHASE_LOCK_BONUS": 18.0,
+    "CHASE_VELOCITY_NEW_WEIGHT": 0.50,
+    "VIRUS_ENEMY_RANGE_MULT": 6.0,
+    "VIRUS_MANUAL_SPLIT_TIME_BONUS": 3.0,
+    "VIRUS_MANUAL_SPLIT_RISK_COST": 2.0,
+    "VIRUS_MAX_FARM_MASS": 180.0,
+    "FOOD_CLUSTER_RADIUS": 4.5,
+    "FOOD_CLUSTER_WEIGHT": 1.2,
+    "FOOD_DISTANCE_POWER": 1.45,
+    "FOOD_LOCK_TICKS": 14,
+    "ROAM_CENTER_WEIGHT": 1.0,
+    "ROAM_MOMENTUM_WEIGHT": 0.35,
+}
+
+
+class Optimizer:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.root = args.root.resolve()
+        self.results = self.root / args.results_dir
+        self.configs = self.results / "configs"
+        self.workspaces = self.results / "workspaces"
+        self.failures = self.results / "failures"
+        for path in (self.results, self.configs, self.workspaces, self.failures):
+            path.mkdir(parents=True, exist_ok=True)
+        self.wrapper = self.root / "bots" / "_tuning_candidate.py"
+        self.environment = os.environ.copy()
+        self.environment.pop("BOT_CONFIG", None)
+        self.environment.pop("BOT_TUNING_PATH", None)
+        self.environment.update({
+            "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1", "BLIS_NUM_THREADS": "1",
+        })
+        self.ensure_wrapper()
+
+    def ensure_wrapper(self) -> None:
+        self.wrapper.parent.mkdir(parents=True, exist_ok=True)
+        source = (
+            "import os\n"
+            "path = os.environ.get('CANDIDATE_CONFIG')\n"
+            "if not path:\n    raise RuntimeError('CANDIDATE_CONFIG missing')\n"
+            "os.environ['BOT_TUNING_PATH'] = path\n"
+            f"from {self.args.candidate_module} import main\n"
+            "if __name__ == '__main__':\n    main()\n"
+        )
+        self.wrapper.write_text(source, encoding="utf-8")
+
+    def save_failure(self, label: str, command: list[str], workspace: Path, output: str, error: Exception) -> None:
+        path = self.failures / f"{label}.log"
+        path.write_text(
+            f"Error: {error}\nWorkspace: {workspace}\nCommand: {' '.join(command)}\n\n{output}",
+            encoding="utf-8",
+            errors="replace",
         )
 
-        shutil.rmtree(workspace, ignore_errors=True)
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        command = [
-            "uv",
-            "run",
-            "simulation",
-            "--headless",
-            "--workspace",
-            str(workspace.resolve()),
-            *bot_arguments,
-        ]
-
-        output = ""
-
-        try:
-            return_code, output = run_simulation(
-                command,
-                environment,
-            )
-
-            timed_out_players = cumulative_timeout_players(
-                output
-            )
-
-            if PLAYER_ID in timed_out_players:
-                raise CandidateTimeoutError(
-                    "Candidate player 0 received "
-                    "CUMULATIVE_TIMEOUT."
+    def evaluate_lineup(self, config_path: Path, lineup: str, count: int, label: str) -> MatchSet:
+        result = MatchSet()
+        if count <= 0:
+            return result
+        bot_arguments = self.args.strongest if lineup == "strongest" else self.args.mixed
+        attempts = 0
+        slot = 0
+        max_attempts = count * self.args.max_attempt_multiplier
+        while slot < count and attempts < max_attempts:
+            attempts += 1
+            workspace = self.workspaces / label / lineup / f"slot_{slot + 1:03d}_attempt_{attempts:03d}"
+            shutil.rmtree(workspace, ignore_errors=True)
+            workspace.mkdir(parents=True, exist_ok=True)
+            command = [
+                "uv", "run", "simulation", "--headless", "--workspace",
+                str(workspace.resolve()), *bot_arguments,
+            ]
+            environment = self.environment.copy()
+            environment["CANDIDATE_CONFIG"] = str(config_path.resolve())
+            output = ""
+            started = time.perf_counter()
+            try:
+                return_code, output = run_process(
+                    command, self.root, environment, self.args.match_timeout
                 )
+                timeout_ids = timed_out_players(output)
+                if self.args.player in timeout_ids:
+                    raise RuntimeError("Candidate cumulative timeout")
+                opponent_timeouts = timeout_ids - {self.args.player}
+                if opponent_timeouts:
+                    # Retry opponent failures without consuming a candidate slot.
+                    raise ChildProcessError(f"Opponent timeout: {sorted(opponent_timeouts)}")
+                mass, rank = parse_workspace_result(workspace, output, self.args.player)
+                if return_code != 0:
+                    raise RuntimeError(f"Simulation exited {return_code}")
+                result.masses.append(mass)
+                result.ranks.append(rank)
+                slot += 1
+                print(f"    {lineup} {slot}/{count}: mass={mass:.2f}, rank={rank}")
+                if not self.args.keep_workspaces:
+                    shutil.rmtree(workspace, ignore_errors=True)
+            except ChildProcessError as error:
+                self.save_failure(f"{label}_{lineup}_{attempts:04d}_retry", command, workspace, output, error)
+                print(f"    {lineup} retry: {error}")
+            except Exception as error:
+                result.failures += 1
+                slot += 1
+                self.save_failure(f"{label}_{lineup}_{attempts:04d}", command, workspace, output, error)
+                print(f"    {lineup} {slot}/{count}: FAILED ({error})")
+            result.elapsed_seconds += time.perf_counter() - started
+        if slot < count:
+            result.failures += count - slot
+        return result
 
-            opponent_timeouts = (
-                timed_out_players - {PLAYER_ID}
-            )
-            if opponent_timeouts:
-                raise OpponentTimeoutError(
-                    "Opponent cumulative timeout: "
-                    f"{sorted(opponent_timeouts)}"
-                )
+    def write_config(self, label: str, config: dict[str, Any]) -> Path:
+        path = self.configs / f"{label}.json"
+        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        return path
 
-            mass, rank = parse_workspace_result(
-                workspace=workspace,
-                output=output,
-                player_id=PLAYER_ID,
-            )
+    def evaluate_stage(self, config_path: Path, label: str, strongest_count: int, mixed_count: int) -> tuple[MatchSet, MatchSet]:
+        strongest = self.evaluate_lineup(config_path, "strongest", strongest_count, label)
+        mixed = self.evaluate_lineup(config_path, "mixed", mixed_count, label)
+        return strongest, mixed
 
-            if return_code != 0:
-                raise RuntimeError(
-                    f"Simulation returned exit code "
-                    f"{return_code}, despite producing a result."
-                )
 
-            masses.append(mass)
-            ranks.append(rank)
-            completed_slots += 1
+def set_trial_attributes(trial: optuna.Trial, strongest: MatchSet, mixed: MatchSet, prefix: str = "") -> None:
+    for name, value in summary(strongest).items():
+        trial.set_user_attr(f"{prefix}strongest_{name}", value)
+    for name, value in summary(mixed).items():
+        trial.set_user_attr(f"{prefix}mixed_{name}", value)
 
-            print(
-                f"    [{lineup_name}] "
-                f"Match {completed_slots}/{match_count}: "
-                f"rank={rank}, mass={mass:.2f}"
-            )
 
-            if not KEEP_SUCCESSFUL_WORKSPACES:
-                shutil.rmtree(
-                    workspace,
-                    ignore_errors=True,
-                )
+def write_study_table(study: optuna.Study, path: Path) -> None:
+    rows = []
+    for trial in study.trials:
+        rows.append({
+            "trial": trial.number,
+            "state": trial.state.name,
+            "value": trial.value,
+            "expected_mass": trial.user_attrs.get("overall_expected_mass", ""),
+            "failure_rate": trial.user_attrs.get("overall_failure_rate", ""),
+            "params": json.dumps(trial.params, sort_keys=True),
+        })
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys() if rows else ["trial"])
+        writer.writeheader()
+        writer.writerows(rows)
 
-        except OpponentTimeoutError as error:
-            # An opponent failure says nothing useful about the candidate.
-            # Retry the same match slot without penalising its fitness.
-            log_path = save_failure_log(
-                trial_name=trial_name,
-                lineup_name=lineup_name,
-                match_number=match_number,
-                attempt_number=attempt_number,
-                command=command,
-                workspace=workspace,
-                output=output,
-                error=error,
-            )
 
-            print(
-                f"    [{lineup_name}] "
-                f"Match {match_number}/{match_count}: "
-                f"RETRY ({error})"
-            )
-            print(f"      Log: {log_path}")
-
-        except Exception as error:
-            # Candidate timeout, crash, parser failure, or a simulator failure:
-            # count this as one failed evaluation slot.
-            failures += 1
-            completed_slots += 1
-
-            log_path = save_failure_log(
-                trial_name=trial_name,
-                lineup_name=lineup_name,
-                match_number=match_number,
-                attempt_number=attempt_number,
-                command=command,
-                workspace=workspace,
-                output=output,
-                error=error,
-            )
-
-            print(
-                f"    [{lineup_name}] "
-                f"Match {completed_slots}/{match_count}: "
-                f"FAILED: {error}"
-            )
-            print(f"      Failure log: {log_path}")
-
-    # Avoid silently giving a candidate fewer evaluated matches when repeated
-    # opponent failures exhaust the retry budget.
-    missing_slots = match_count - completed_slots
-    if missing_slots > 0:
-        failures += missing_slots
-        completed_slots += missing_slots
-
-        print(
-            f"    [{lineup_name}] Retry limit reached; "
-            f"counting {missing_slots} missing match(es) "
-            "as failures."
-        )
-
-    summary = summarise_results(
-        masses=masses,
-        ranks=ranks,
-        failures=failures,
-        total_matches=match_count,
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--hours", type=float, default=12.0)
+    parser.add_argument("--search-fraction", type=float, default=0.76)
+    parser.add_argument("--max-trials", type=int, default=10000)
+    parser.add_argument("--player", type=int, default=0)
+    parser.add_argument("--candidate-module", default="my_bot")
+    parser.add_argument("--results-dir", default="results/clean_tuning")
+    parser.add_argument("--study-name", default="clean_bot_overnight_v1")
+    parser.add_argument("--match-timeout", type=float, default=180.0)
+    parser.add_argument("--max-attempt-multiplier", type=int, default=3)
+    parser.add_argument("--stage1-strongest", type=int, default=4)
+    parser.add_argument("--stage1-mixed", type=int, default=2)
+    parser.add_argument("--stage2-strongest", type=int, default=8)
+    parser.add_argument("--stage2-mixed", type=int, default=3)
+    parser.add_argument("--finalists", type=int, default=5)
+    parser.add_argument("--final-strongest", type=int, default=30)
+    parser.add_argument("--final-mixed", type=int, default=10)
+    parser.add_argument("--keep-workspaces", action="store_true")
+    parser.add_argument(
+        "--strongest", nargs="+",
+        default=["1:bots/_tuning_candidate.py", "7:bots/other_bots2.py"],
     )
-
-    return {
-        **summary,
-        "masses": masses,
-        "ranks": ranks,
-        "failures": failures,
-    }
-
-
-def evaluate(config_path: Path) -> dict[str, float]:
-    environment = os.environ.copy()
-
-    # Never let opponents inherit a BOT_CONFIG from the shell.
-    environment.pop("BOT_CONFIG", None)
-
-    # Only _tuning_candidate.py reads this variable and converts it to
-    # BOT_CONFIG inside player 0's process.
-    environment["CANDIDATE_CONFIG"] = str(
-        config_path.resolve()
+    parser.add_argument(
+        "--mixed", nargs="+",
+        default=[
+            "1:bots/_tuning_candidate.py", "2:bots/other_bot.py",
+            "2:bots/other_bots.py", "3:bots/other_bots2.py",
+        ],
     )
+    args = parser.parse_args()
+    if args.hours <= 0 or not 0.1 <= args.search_fraction <= 0.95:
+        parser.error("Use --hours > 0 and --search-fraction between 0.1 and 0.95")
 
-    # Eight NumPy bots must not each create a pool of BLAS worker threads.
-    environment.update({
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-        "VECLIB_MAXIMUM_THREADS": "1",
-        "BLIS_NUM_THREADS": "1",
-    })
-
-    strongest = evaluate_lineup(
-        config_path=config_path,
-        bot_arguments=STRONGEST_BOT_ARGUMENTS,
-        match_count=STRONGEST_MATCHES,
-        lineup_name="strongest",
-        environment=environment,
-    )
-
-    mixed = evaluate_lineup(
-        config_path=config_path,
-        bot_arguments=MIXED_BOT_ARGUMENTS,
-        match_count=MIXED_MATCHES,
-        lineup_name="mixed",
-        environment=environment,
-    )
-
-    overall_masses = (
-        strongest["masses"]
-        + mixed["masses"]
-    )
-    overall_ranks = (
-        strongest["ranks"]
-        + mixed["ranks"]
-    )
-    overall_failures = (
-        strongest["failures"]
-        + mixed["failures"]
-    )
-
-    overall = summarise_results(
-        masses=overall_masses,
-        ranks=overall_ranks,
-        failures=overall_failures,
-        total_matches=MATCHES_PER_TRIAL,
-    )
-
-    combined_fitness = (
-        0.70 * strongest["fitness"]
-        + 0.30 * mixed["fitness"]
-    )
-
-    return {
-        "fitness": float(combined_fitness),
-
-        "average_rank": overall["average_rank"],
-        "median_mass": overall["median_mass"],
-        "average_mass": overall["average_mass"],
-        "win_rate": overall["win_rate"],
-        "top_three_rate": overall["top_three_rate"],
-        "failure_rate": overall["failure_rate"],
-
-        "strongest_fitness": strongest["fitness"],
-        "strongest_average_rank": strongest["average_rank"],
-        "strongest_median_mass": strongest["median_mass"],
-        "strongest_win_rate": strongest["win_rate"],
-        "strongest_top_three_rate": strongest["top_three_rate"],
-        "strongest_failure_rate": strongest["failure_rate"],
-
-        "mixed_fitness": mixed["fitness"],
-        "mixed_average_rank": mixed["average_rank"],
-        "mixed_median_mass": mixed["median_mass"],
-        "mixed_win_rate": mixed["win_rate"],
-        "mixed_top_three_rate": mixed["top_three_rate"],
-        "mixed_failure_rate": mixed["failure_rate"],
-    }
-
-
-# ============================================================
-# Optuna objective
-# ============================================================
-
-def objective(trial: optuna.Trial) -> float:
-    config = {
-        "TURN_WEIGHT": trial.suggest_float(
-            "TURN_WEIGHT",
-            20.0,
-            130.0,
-        ),
-        "FOOD_CLUSTER_WEIGHT": trial.suggest_float(
-            "FOOD_CLUSTER_WEIGHT",
-            0.15,
-            1.10,
-        ),
-        "FOOD_DISTANCE_POWER": trial.suggest_float(
-            "FOOD_DISTANCE_POWER",
-            0.85,
-            1.60,
-        ),
-        "DANGER_OVERRIDE_RANGE_MULT": trial.suggest_float(
-            "DANGER_OVERRIDE_RANGE_MULT",
-            5.5,
-            11.0,
-        ),
-        "DANGER_DIRECT_RATIO": trial.suggest_float(
-            "DANGER_DIRECT_RATIO",
-            1.02,
-            1.15,
-        ),
-        "CHASE_RANGE_MULT": trial.suggest_float(
-            "CHASE_RANGE_MULT",
-            3.5,
-            8.0,
-        ),
-        "CHASE_LEAD_TICKS": trial.suggest_float(
-            "CHASE_LEAD_TICKS",
-            1.2,
-            4.2,
-        ),
-        "CHASE_MIN_CLOSING_RATE": trial.suggest_float(
-            "CHASE_MIN_CLOSING_RATE",
-            -2.5,
-            0.0,
-        ),
-        "CHASE_CLOSE_WEIGHT": trial.suggest_float(
-            "CHASE_CLOSE_WEIGHT",
-            10.0,
-            60.0,
-        ),
-        "SPLIT_RANGE_SAFETY_MULT": trial.suggest_float(
-            "SPLIT_RANGE_SAFETY_MULT",
-            0.65,
-            0.86,
-        ),
-        "SPLIT_TARGET_MIN_RADIUS_MULT": trial.suggest_float(
-            "SPLIT_TARGET_MIN_RADIUS_MULT",
-            0.08,
-            0.30,
-        ),
-        "VIRUS_FARM_MAX_RADIUS": trial.suggest_float(
-            "VIRUS_FARM_MAX_RADIUS",
-            12.0,
-            24.0,
-        ),
-    }
-
-    config_path = (
-        CONFIG_DIR
-        / f"trial_{trial.number:04d}.json"
-    )
-
-    config_path.write_text(
-        json.dumps(config, indent=2),
-        encoding="utf-8",
-    )
-
-    print(f"\nTrial {trial.number}")
-    print(json.dumps(config, indent=2))
-
-    results = evaluate(config_path)
-
-    for name, value in results.items():
-        if name != "fitness":
-            trial.set_user_attr(name, value)
-
-    print(
-        f"  Fitness={results['fitness']:.4f}, "
-        f"average rank={results['average_rank']:.2f}, "
-        f"median mass={results['median_mass']:.2f}, "
-        f"failures={results['failure_rate']:.1%}"
-    )
-
-    print(
-        f"    Strongest: "
-        f"fitness={results['strongest_fitness']:.4f}, "
-        f"avg rank={results['strongest_average_rank']:.2f}"
-    )
-
-    print(
-        f"    Mixed:     "
-        f"fitness={results['mixed_fitness']:.4f}, "
-        f"avg rank={results['mixed_average_rank']:.2f}"
-    )
-
-    return results["fitness"]
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main() -> None:
-    ensure_candidate_wrapper()
-
+    optimizer = Optimizer(args)
+    database = optimizer.results / "study.db"
     study = optuna.create_study(
-        study_name=STUDY_NAME,
-        storage=f"sqlite:///{DATABASE_PATH}",
+        study_name=args.study_name,
+        storage=f"sqlite:///{database}",
         load_if_exists=True,
         direction="maximize",
         sampler=optuna.samplers.TPESampler(
-            seed=31,
+            seed=31, multivariate=True, group=True, n_startup_trials=14,
+        ),
+        pruner=optuna.pruners.PercentilePruner(
+            percentile=50.0, n_startup_trials=12, n_warmup_steps=0,
         ),
     )
+    if not study.trials:
+        study.enqueue_trial(DEFAULT_TRIAL)
 
-    # Queue known reference configurations only for a fresh study.
-    if len(study.trials) == 0:
-        study.enqueue_trial(BASELINE_CONFIG)
-        study.enqueue_trial(TRIAL_17_CONFIG)
+    overall_deadline = time.monotonic() + args.hours * 3600.0
+    search_seconds = args.hours * 3600.0 * args.search_fraction
 
-    remaining_trials = max(
-        0,
-        NUMBER_OF_TRIALS - len(study.trials),
-    )
+    def objective(trial: optuna.Trial) -> float:
+        config = suggest_config(trial)
+        label = f"trial_{trial.number:05d}"
+        config_path = optimizer.write_config(label, config)
+        print(f"\n{label}: order={trial.params['ORDER_PROFILE']}")
 
-    if remaining_trials > 0:
+        strongest, mixed = optimizer.evaluate_stage(
+            config_path, label + "_stage1",
+            args.stage1_strongest, args.stage1_mixed,
+        )
+        stage1 = combined_fitness(strongest, mixed)
+        trial.report(stage1, step=0)
+        set_trial_attributes(trial, strongest, mixed, "stage1_")
+        if trial.should_prune():
+            print(f"  pruned after stage 1: expected mass={stage1:.3f}")
+            raise optuna.TrialPruned()
+
+        add_strongest, add_mixed = optimizer.evaluate_stage(
+            config_path, label + "_stage2",
+            args.stage2_strongest, args.stage2_mixed,
+        )
+        strongest.extend(add_strongest)
+        mixed.extend(add_mixed)
+        fitness = combined_fitness(strongest, mixed)
+        trial.report(fitness, step=1)
+        set_trial_attributes(trial, strongest, mixed)
+        total = MatchSet(
+            masses=strongest.masses + mixed.masses,
+            ranks=strongest.ranks + mixed.ranks,
+            failures=strongest.failures + mixed.failures,
+            elapsed_seconds=strongest.elapsed_seconds + mixed.elapsed_seconds,
+        )
+        for name, value in summary(total).items():
+            trial.set_user_attr(f"overall_{name}", value)
+        print(f"  completed: expected mass={fitness:.3f}, failures={summary(total)['failure_rate']:.1%}")
+        write_study_table(study, optimizer.results / "trials.csv")
+        return fitness
+
+    try:
         study.optimize(
             objective,
-            n_trials=remaining_trials,
+            n_trials=max(0, args.max_trials - len(study.trials)),
+            timeout=search_seconds,
+            gc_after_trial=True,
         )
-    else:
-        print(
-            f"Study already contains "
-            f"{len(study.trials)} trials; "
-            "nothing left to run."
-        )
+    except KeyboardInterrupt:
+        print("\nSearch interrupted; proceeding with completed trials.")
 
-    best_trial = study.best_trial
-
-    print("\n" + "=" * 60)
-    print("BEST RESULT")
-    print("=" * 60)
-    print(f"Trial:   {best_trial.number}")
-    print(f"Fitness: {best_trial.value:.4f}")
-    print(json.dumps(best_trial.params, indent=2))
-
-    print("\nValidation reminder:")
-    print(
-        "Benchmark the top 3 candidates over a much larger "
-        "number of games before choosing a final bot."
+    completed = sorted(
+        (trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE),
+        key=lambda trial: trial.value if trial.value is not None else -float("inf"),
+        reverse=True,
     )
+    if not completed:
+        print("No completed trials")
+        return 1
+
+    # Recreate exact configs from saved trial files; params contain ORDER_PROFILE
+    # rather than the actual OVERRIDE_ORDER list.
+    finalists = completed[:args.finalists]
+    validation_rows = []
+    for place, trial in enumerate(finalists, 1):
+        if time.monotonic() >= overall_deadline:
+            print("Overall time budget reached before all finalists were validated")
+            break
+        source = optimizer.configs / f"trial_{trial.number:05d}.json"
+        label = f"finalist_{place}_trial_{trial.number:05d}"
+        print(f"\nValidating {label}")
+        strongest, mixed = optimizer.evaluate_stage(
+            source, label, args.final_strongest, args.final_mixed,
+        )
+        fitness = combined_fitness(strongest, mixed)
+        row = {
+            "place": place,
+            "trial": trial.number,
+            "search_fitness": trial.value,
+            "validation_expected_mass": fitness,
+            "strongest_expected_mass": expected_mass(strongest),
+            "mixed_expected_mass": expected_mass(mixed),
+            "failures": strongest.failures + mixed.failures,
+            "matches": strongest.scheduled + mixed.scheduled,
+            "config": str(source),
+        }
+        validation_rows.append(row)
+
+    validation_rows.sort(key=lambda row: row["validation_expected_mass"], reverse=True)
+    validation_path = optimizer.results / "finalists.csv"
+    if validation_rows:
+        with validation_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=validation_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(validation_rows)
+        winner = validation_rows[0]
+        winner_config = Path(winner["config"])
+        shutil.copyfile(winner_config, optimizer.results / "best_validated_config.json")
+        print("\nBEST VALIDATED CONFIG")
+        print(json.dumps(json.loads(winner_config.read_text(encoding="utf-8")), indent=2))
+        print(f"Expected mass: {winner['validation_expected_mass']:.3f}")
+    else:
+        best = completed[0]
+        source = optimizer.configs / f"trial_{best.number:05d}.json"
+        shutil.copyfile(source, optimizer.results / "best_search_config.json")
+
+    write_study_table(study, optimizer.results / "trials.csv")
+    print(f"\nResults: {optimizer.results}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

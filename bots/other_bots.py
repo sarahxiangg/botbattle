@@ -12,6 +12,12 @@ from lib.models.penguin_model import DirectionModel
 
 TAU = 2.0 * math.pi
 
+# Bound all repeated scoring. Food clustering is quadratic, while threat and
+# virus checks multiply by the number of owned pieces.
+MAX_FOOD_CONSIDERED = 28
+MAX_BLOBS_CONSIDERED = 20
+MAX_VIRUSES_CONSIDERED = 10
+
 # Engine-grounded constants from agario-public-main.
 BASE_PLAYER_SPEED = 1.1
 PLAYER_SPEED_RADIUS_FACTOR = 0.08
@@ -118,6 +124,16 @@ class _Ctx:
 
 def _pos(obj) -> np.ndarray:
     return np.array(obj.pos, dtype=float)
+
+
+def _nearest(objects: list, origin: np.ndarray, limit: int) -> list:
+    if len(objects) <= limit:
+        return objects
+    ox, oy = float(origin[0]), float(origin[1])
+    return sorted(
+        objects,
+        key=lambda obj: (float(obj.pos[0]) - ox) ** 2 + (float(obj.pos[1]) - oy) ** 2,
+    )[:limit]
 
 
 def _radius(obj, default: float = 1.0) -> float:
@@ -750,12 +766,18 @@ def choose_direction(game: Game) -> tuple[float, float, bool]:
     max_rounds = int(getattr(game.state, "max_rounds", 1) or 1)
     round_frac = cur_round / max(1, max_rounds)
 
-    visible_blobs = list(game.state.visible_blobs or [])
-    visible_food = list(game.state.visible_food or [])
-    visible_viruses = list(game.state.visible_viruses or [])
     player_pos = np.array([me.x, me.y], dtype=float)
     player_radius = _radius(me)
     my_blobs = _active_blobs(me)
+    visible_blobs = _nearest(
+        list(game.state.visible_blobs or []), player_pos, MAX_BLOBS_CONSIDERED
+    )
+    visible_food = _nearest(
+        list(game.state.visible_food or []), player_pos, MAX_FOOD_CONSIDERED
+    )
+    visible_viruses = _nearest(
+        list(game.state.visible_viruses or []), player_pos, MAX_VIRUSES_CONSIDERED
+    )
 
     ctx = _Ctx(
         player_id=me.player_id,

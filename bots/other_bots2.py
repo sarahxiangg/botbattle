@@ -10,25 +10,24 @@ import numpy as np
 # Constants
 # =========================
 
-NUM_DIRECTIONS = 16
+NUM_DIRECTIONS = 8
 DIRECTIONS = np.array([
     [np.cos(2 * np.pi * i / NUM_DIRECTIONS),
      np.sin(2 * np.pi * i / NUM_DIRECTIONS)]
     for i in range(NUM_DIRECTIONS)
 ], dtype=float)
 
-# Used only when already split. Chase is disabled then, so 8-way movement is
-# enough and cuts repeated safety scoring roughly in half.
+# Four directions are sufficient for the cheaper split-state safety pass.
 DIRECTIONS_FAST = DIRECTIONS[::2]
 
 ARENA_SIZE = 60.0
 OFF_MAP_PENALTY = 1_000_000_000.0
 
 # Performance caps
-MAX_FOOD_CONSIDERED = 28
-MAX_BLOBS_CONSIDERED = 22
-MAX_VIRUSES_CONSIDERED = 12
-MAX_OWN_BLOBS_CONSIDERED = 3
+MAX_FOOD_CONSIDERED = 20
+MAX_BLOBS_CONSIDERED = 16
+MAX_VIRUSES_CONSIDERED = 8
+MAX_OWN_BLOBS_CONSIDERED = 2
 
 
 # Movement
