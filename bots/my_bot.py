@@ -4,8 +4,6 @@ from lib.interface.queries.query_move import QueryMovePlayer
 from lib.models.penguin_model import DirectionModel
 
 import os
-import json
-
 import numpy as np
 
 
@@ -13,9 +11,9 @@ import numpy as np
 # Tuning surface
 # =============================================================================
 #
-# Every strategically meaningful number lives here. An optimiser can write a
-# JSON object to BOT_TUNING_PATH; unknown keys fail loudly so experiments never
-# silently tune a misspelled parameter. OVERRIDE_ORDER is tunable as a list.
+# Every strategically meaningful number remains centralized here so a later
+# optimiser can expose selected values.  This competition build is deliberately
+# standalone: it performs no filesystem/config reads during startup.
 
 PARAMS = {
     # Engine / bounded work
@@ -27,13 +25,14 @@ PARAMS = {
     "MAX_VIRUSES": 14,
     "SAFETY_OWN_PIECES": 2,
     "STEP_RADIUS_MULT": 1.2709918139713585,
-    "EAT_MASS_RATIO": 1.12,
+    "MOVE_LOOKAHEAD_TICKS": 3.0,
+    "EAT_MASS_RATIO": 1.20,
 
     # Shared split geometry
     "SPLIT_MIN_RADIUS": 2.0,
     "SPLIT_TRAVEL_MULT": 2.50,
     "SPLIT_REACH_RELIABILITY": 0.6931558907420518,
-    "SPLIT_TARGET_EAT_RATIO": 1.10,
+    "SPLIT_TARGET_EAT_RATIO": 1.20,
     "MAX_SPLIT_DEPTH": 4,
 
     # Escape: direct and generalized enemy split threats
@@ -66,6 +65,7 @@ PARAMS = {
     "SPLIT_MIN_UTILITY": 4.020980901689232,
     "SPLIT_LARGER_OWNER_RATIO": 1.013412343039414,
     "SPLIT_PLAN_WAIT_TICKS": 3,
+    "COUNTER_SPLIT_MIN_GAIN_RATIO": 0.10,
 
     # Chase / predictive interception
     "CHASE_ACQUIRE_RANGE_MULT": 6.937850048841669,
@@ -86,7 +86,9 @@ PARAMS = {
     "MIN_PLAYER_SPEED": 0.25,
 
     # Virus farming
-    "VIRUS_EAT_RATIO": 1.10,
+    # Engine virus test is blob.mass > virus.radius * this ratio.  It is not
+    # a radius-vs-radius comparison like blob consumption.
+    "VIRUS_EAT_RATIO": 1.20,
     "VIRUS_DANGER_BUFFER_MULT": 1.10,
     "VIRUS_ENEMY_RANGE_MULT": 5.324337587731354,
     "VIRUS_PIECE_RADIUS_MULT": 0.35,
@@ -111,37 +113,7 @@ PARAMS = {
     "ROAM_MOMENTUM_WEIGHT": 0.5075238366840418,
 }
 
-OVERRIDE_ORDER = ["escape", "unstuck", "split", "virus", "chase", "food"]
-
-
-# def load_tuning_config():
-#     """Load flat numeric parameters and optional override order from JSON."""
-#     global OVERRIDE_ORDER
-#     # BOT_CONFIG is accepted for compatibility with earlier tournament
-#     # wrappers; BOT_TUNING_PATH is the canonical name for the clean bot.
-#     path = os.getenv("BOT_TUNING_PATH") or os.getenv("BOT_CONFIG")
-#     if not path:
-#         return
-
-#     with open(path, "r", encoding="utf-8") as handle:
-#         values = json.load(handle)
-#     if not isinstance(values, dict):
-#         raise ValueError("Tuning config must be a JSON object")
-
-#     allowed = set(PARAMS) | {"OVERRIDE_ORDER"}
-#     unknown = set(values) - allowed
-#     if unknown:
-#         raise ValueError(f"Unknown tuning parameters: {sorted(unknown)}")
-
-#     for name, value in values.items():
-#         if name == "OVERRIDE_ORDER":
-#             if sorted(value) != sorted(OVERRIDE_ORDER):
-#                 raise ValueError("OVERRIDE_ORDER must contain each strategy exactly once")
-#             OVERRIDE_ORDER = list(value)
-#             continue
-#         default = PARAMS[name]
-#         PARAMS[name] = type(default)(value)
-#     refresh_derived()
+OVERRIDE_ORDER = ["escape", "split", "virus", "chase", "unstuck", "food"]
 
 
 P = PARAMS
@@ -217,6 +189,14 @@ def movement_speed(radius):
     )
 
 
+def can_pop_virus(blob_radius, virus_radius):
+    """Apply the engine's intentionally asymmetric virus collision test."""
+    return (
+        np.asarray(blob_radius, dtype=float) ** 2
+        > np.asarray(virus_radius, dtype=float) * P["VIRUS_EAT_RATIO"]
+    )
+
+
 def clamp_points(points, radii):
     points = np.asarray(points, dtype=float).copy()
     radii = np.asarray(radii, dtype=float)
@@ -251,8 +231,15 @@ def segment_distances(start, end, points):
 def max_split_depth(piece_count):
     if piece_count <= 0 or piece_count >= P["MAX_BLOBS"]:
         return 0
-    cap_depth = int(np.floor(np.log2(P["MAX_BLOBS"] / piece_count)))
-    return max(0, min(P["MAX_SPLIT_DEPTH"], cap_depth))
+    # A global split can partially fill the 16-piece cap.  floor(log2(cap/n))
+    # incorrectly says that 3->6->12 may split only twice, even though a third
+    # command validly produces 16.  Simulate the bounded count exactly.
+    depth = 0
+    count = int(piece_count)
+    while count < P["MAX_BLOBS"] and depth < P["MAX_SPLIT_DEPTH"]:
+        count = min(P["MAX_BLOBS"], count * 2)
+        depth += 1
+    return depth
 
 
 def split_profile(radius, depth):
@@ -538,6 +525,8 @@ def build_cache(game):
         "food_locs": food_locs,
         "virus_locs": virus_locs,
         "virus_rads": virus_rads,
+        # Kept for backwards-compatible tuning files; movement projection is
+        # now per-piece and engine-speed based in future_own_positions().
         "step": P["STEP_RADIUS_MULT"] * float(np.sqrt(total_mass)),
     }
 
@@ -565,8 +554,14 @@ def enemy_reach_options(enemy_radius, owner_count, target_radius):
     if enemy_mass < target_mass * P["EAT_MASS_RATIO"]:
         return
 
-    proximity = target_radius * P["ESCAPE_DIRECT_RANGE_MULT"]
-    yield 0, enemy_radius, enemy_radius + proximity
+    # ESCAPE_DIRECT_RANGE_MULT is a reaction horizon in ticks.  The previous
+    # target_radius * multiplier inflated a direct attack by 20-30 world units
+    # and made escape dominate almost every encounter.  Direct capture is the
+    # enemy radius plus the distance that enemy can actually move soon.
+    direct_motion = (
+        movement_speed(enemy_radius) * P["ESCAPE_DIRECT_RANGE_MULT"]
+    )
+    yield 0, enemy_radius, enemy_radius + direct_motion
 
     for depth in range(1, max_split_depth(owner_count) + 1):
         before, after, _ = split_profile(enemy_radius, depth)
@@ -670,7 +665,11 @@ def threat_state(cache, own_locs=None, own_rads=None):
 
 def future_own_positions(cache, direction):
     starts = cache["own_locs"]
-    ends = starts + direction[None, :] * cache["step"]
+    steps = np.array([
+        movement_speed(radius) * P["MOVE_LOOKAHEAD_TICKS"]
+        for radius in cache["own_rads"]
+    ], dtype=float)
+    ends = starts + direction[None, :] * steps[:, None]
     return clamp_points(ends, cache["own_rads"])
 
 
@@ -680,7 +679,7 @@ def virus_paths_safe(cache, direction):
     starts = cache["own_locs"]
     ends = future_own_positions(cache, direction)
     for start, end, own_radius in zip(starts, ends, cache["own_rads"]):
-        dangerous = own_radius > cache["virus_rads"] * P["VIRUS_EAT_RATIO"]
+        dangerous = can_pop_virus(own_radius, cache["virus_rads"])
         if not np.any(dangerous):
             continue
         distances, _ = segment_distances(start, end, cache["virus_locs"])
@@ -715,8 +714,8 @@ def virus_shield_score(cache, futures, active_threats):
         own_i = threat["own_index"]
         own_radius = float(cache["own_rads"][own_i])
         enemy_radius = float(threat["enemy_radius"])
-        own_safe = own_radius <= cache["virus_rads"] * P["VIRUS_EAT_RATIO"]
-        enemy_pops = enemy_radius > cache["virus_rads"] * P["VIRUS_EAT_RATIO"]
+        own_safe = ~can_pop_virus(own_radius, cache["virus_rads"])
+        enemy_pops = can_pop_virus(enemy_radius, cache["virus_rads"])
         useful = own_safe & enemy_pops
         if not np.any(useful):
             continue
@@ -741,6 +740,16 @@ def override_escape(cache):
     _, active = threat_state(cache)
     if not active:
         return None
+
+    # Escape is not an unconditional veto on offense.  If one immediate split
+    # eats enough nearby mass that the fed piece survives every remaining
+    # attack envelope, taking the food is the stronger escape.
+    counter = best_escape_counter_split(cache)
+    if counter is not None:
+        SPLIT_PLAN_PID = None
+        SPLIT_PLAN_STEPS = 0
+        direction = counter["direction"]
+        return float(direction[0]), float(direction[1]), True
 
     SPLIT_PLAN_PID = None
     SPLIT_PLAN_STEPS = 0
@@ -900,7 +909,7 @@ def rollout_split(cache, direction, depth):
                 distances, _ = segment_distances(
                     start, end, cache["virus_locs"]
                 )
-                dangerous = radius > cache["virus_rads"] * P["VIRUS_EAT_RATIO"]
+                dangerous = can_pop_virus(radius, cache["virus_rads"])
                 if np.any(dangerous & (
                     distances <= radius + cache["virus_rads"]
                 )):
@@ -908,12 +917,20 @@ def rollout_split(cache, direction, depth):
 
         eaten_this_step = []
         if len(cache["enemy_locs"]) > 0:
+            # The split resolves against where prey is moving, not a frozen
+            # screenshot.  One prediction tick per split command is enough to
+            # catch lateral runners without expensive branching.
+            enemy_positions = clamp_points(
+                cache["enemy_locs"]
+                + cache["enemy_velocities"] * float(step + 1),
+                cache["enemy_rads"],
+            )
             # Precompute target distance/progress to every new piece path.
             distance_matrix = np.empty((len(masses), len(cache["enemy_locs"])))
             progress_matrix = np.empty_like(distance_matrix)
             for piece_index, (start, end) in enumerate(zip(path_starts, path_ends)):
                 distance_matrix[piece_index], progress_matrix[piece_index] = (
-                    segment_distances(start, end, cache["enemy_locs"])
+                    segment_distances(start, end, enemy_positions)
                 )
 
             target_order = np.argsort(np.min(progress_matrix, axis=0))
@@ -983,6 +1000,44 @@ def split_external_risk(cache, rollout, target_pid):
     return risk
 
 
+def split_target_priority(cache, target_index, maximum_depth):
+    """Cheap reach/payoff ranking before running the bounded split rollout."""
+    target_pos = cache["enemy_locs"][target_index]
+    target_radius = float(cache["enemy_rads"][target_index])
+    target_mass = target_radius ** 2
+    velocity = cache["enemy_velocities"][target_index]
+    best_gap = float("inf")
+    feasible = False
+
+    for own_pos, own_radius in zip(
+        cache["own_locs_all"], cache["own_rads_all"]
+    ):
+        for depth in range(1, maximum_depth + 1):
+            before, after, travels = split_profile(float(own_radius), depth)
+            if np.any(before < P["SPLIT_MIN_RADIUS"]):
+                break
+            final_radius = float(after[-1])
+            if not can_eat_mass(
+                final_radius ** 2,
+                target_mass,
+                P["SPLIT_TARGET_EAT_RATIO"],
+            ):
+                continue
+            predicted = clamp_point(
+                target_pos + velocity * float(depth), target_radius
+            )
+            distance = float(np.linalg.norm(predicted - own_pos))
+            reach = float(np.sum(travels) + final_radius)
+            gap = max(0.0, distance - reach)
+            best_gap = min(best_gap, gap)
+            feasible = feasible or gap <= movement_speed(final_radius) * 1.5
+
+    # Nearby edible crumbs must outrank distant large targets, while a target
+    # already inside a credible split envelope receives a decisive boost.
+    value = target_mass / (1.0 + best_gap)
+    return (1 if feasible else 0, value)
+
+
 def split_opportunities(cache, required_pid=None, max_depth_override=None):
     if len(cache["enemy_locs"]) == 0:
         return []
@@ -992,12 +1047,18 @@ def split_opportunities(cache, required_pid=None, max_depth_override=None):
     if maximum_depth <= 0:
         return []
 
-    target_indices = np.argsort(cache["enemy_rads"])[::-1]
+    target_indices = np.arange(len(cache["enemy_locs"]), dtype=int)
     if required_pid is not None:
         target_indices = target_indices[
             cache["enemy_pids"][target_indices] == int(required_pid)
         ]
-    target_indices = target_indices[:P["SPLIT_MAX_TARGETS"]]
+    target_indices = sorted(
+        (int(index) for index in target_indices),
+        key=lambda index: split_target_priority(
+            cache, index, maximum_depth
+        ),
+        reverse=True,
+    )[:P["SPLIT_MAX_TARGETS"]]
 
     opportunities = []
     for target_index in target_indices:
@@ -1014,11 +1075,17 @@ def split_opportunities(cache, required_pid=None, max_depth_override=None):
 
         for launcher_index in launcher_order:
             launcher_mass = float(cache["own_rads_all"][launcher_index] ** 2)
-            direction = unit(target_pos - cache["own_locs_all"][launcher_index])
-            if direction is None:
-                continue
-
             for depth in range(1, maximum_depth + 1):
+                predicted_target = clamp_point(
+                    target_pos
+                    + cache["enemy_velocities"][target_index] * float(depth),
+                    float(cache["enemy_rads"][target_index]),
+                )
+                direction = unit(
+                    predicted_target - cache["own_locs_all"][launcher_index]
+                )
+                if direction is None:
+                    continue
                 rollout = rollout_split(cache, direction, depth)
                 if rollout is None or not rollout["captured"][target_index]:
                     continue
@@ -1073,6 +1140,43 @@ def split_opportunities(cache, required_pid=None, max_depth_override=None):
 
     opportunities.sort(key=lambda item: item["utility"], reverse=True)
     return opportunities
+
+
+def counter_split_survives(cache, opportunity):
+    """Whether an immediate mass-gaining split escapes all known punishers."""
+    rollout = opportunity["rollout"]
+    if (
+        rollout["captured_mass"]
+        < cache["mass"] * P["COUNTER_SPLIT_MIN_GAIN_RATIO"]
+    ):
+        return False
+
+    fed_pos = rollout["position"]
+    fed_radius = rollout["radius"]
+    for enemy in enemy_threat_sources(cache):
+        visible_index = enemy["visible_index"]
+        if (
+            visible_index is not None
+            and rollout["captured"][visible_index]
+        ):
+            continue
+        distance = float(np.linalg.norm(enemy["position"] - fed_pos))
+        for _, _, reach in enemy_reach_options(
+            enemy["radius"], enemy["count"], fed_radius
+        ):
+            if distance <= reach * enemy["confidence"]:
+                return False
+    return True
+
+
+def best_escape_counter_split(cache):
+    """Return the best one-tick counter-capture, never a speculative combo."""
+    for option in split_opportunities(cache, max_depth_override=1):
+        if option["utility"] < P["SPLIT_MIN_UTILITY"]:
+            break
+        if counter_split_survives(cache, option):
+            return option
+    return None
 
 
 def clear_split_plan():
@@ -1231,8 +1335,11 @@ def override_chase(cache):
         return None
 
     candidates = []
+    # Every fragment is a potential hunter.  Restricting this to the two
+    # largest blobs wastes most of a 16-piece swarm even when a local fragment
+    # can finish prey immediately.
     for own_index, (hunter_pos, hunter_radius) in enumerate(zip(
-        cache["own_locs"], cache["own_rads"]
+        cache["own_locs_all"], cache["own_rads_all"]
     )):
         hunter_mass = float(hunter_radius ** 2)
         hunter_step = movement_speed(hunter_radius)
@@ -1363,7 +1470,11 @@ def virus_action_safe(cache, virus_pos, piece_radius):
             enemy["radius"], enemy["count"], piece_radius
         ):
             reach *= enemy["confidence"]
-            if distance <= reach + cache["radius"] * P["VIRUS_ENEMY_RANGE_MULT"]:
+            reaction = (
+                movement_speed(enemy["radius"])
+                * P["VIRUS_ENEMY_RANGE_MULT"]
+            )
+            if distance <= reach + reaction:
                 return False
     return True
 
@@ -1382,7 +1493,7 @@ def movement_safe_to_virus(cache, direction, target_pos, expected_piece_radius):
         if len(cache["virus_locs"]) == 0:
             continue
         distances, _ = segment_distances(start, end, cache["virus_locs"])
-        dangerous = own_radius > cache["virus_rads"] * P["VIRUS_EAT_RATIO"]
+        dangerous = can_pop_virus(own_radius, cache["virus_rads"])
         for index, virus_pos in enumerate(cache["virus_locs"]):
             if np.linalg.norm(virus_pos - target_pos) <= 0.2:
                 dangerous[index] = False
@@ -1428,10 +1539,23 @@ def override_virus(cache):
             np.linalg.norm(pos - virus_pos) <= 0.2
             for pos in cache["virus_locs"]
         )
+        # At the 16-piece cap every collision consumes a virus, so whichever
+        # fragment is nearest should route the global movement.  Before the
+        # cap, retain the two strategically important pieces to keep work and
+        # accidental-pop exposure bounded.
+        if cache["own_count"] >= P["MAX_BLOBS"]:
+            virus_own_locs = cache["own_locs_all"]
+            virus_own_rads = cache["own_rads_all"]
+        else:
+            virus_own_locs = cache["own_locs"]
+            virus_own_rads = cache["own_rads"]
         for own_index, (own_pos, own_radius) in enumerate(zip(
-            cache["own_locs"], cache["own_rads"]
+            virus_own_locs, virus_own_rads
         )):
-            if own_radius <= virus_radius * P["VIRUS_EAT_RATIO"]:
+            if (
+                cache["own_count"] < P["MAX_BLOBS"]
+                and not can_pop_virus(own_radius, virus_radius)
+            ):
                 continue
             distance = float(np.linalg.norm(virus_pos - own_pos))
             edge_distance = max(distance - own_radius - virus_radius, 0.0)
@@ -1453,8 +1577,8 @@ def override_virus(cache):
                 + P["VIRUS_CHAIN_WEIGHT"] * chain_value
             ) / max(travel_ticks + 1.0, 1.0)
             if not visible:
-                value *= 0.65
-            if key == VIRUS_TARGET_KEY and visible:
+                value *= 0.65 if key == VIRUS_TARGET_KEY else 0.50
+            if key == VIRUS_TARGET_KEY:
                 value *= P["VIRUS_TARGET_LOCK_BONUS"]
             opportunities.append({
                 "key": key,
@@ -1470,20 +1594,18 @@ def override_virus(cache):
     if not opportunities:
         VIRUS_TARGET_KEY = None
         return None
-    # A visible locked target wins ties and score fluctuations outright. If it
-    # disappeared far away, visible alternatives may supersede stale memory.
-    opportunities.sort(
-        key=lambda item: (
-            item["key"] == VIRUS_TARGET_KEY and item["visible"],
-            item["visible"],
-            item["value"],
-        ),
-        reverse=True,
-    )
+    # Rank by payoff with a continuity bonus instead of making visibility an
+    # absolute priority.  The latter caused target flips every time a virus
+    # crossed the vision boundary—the observed back-and-forth behaviour.
+    opportunities.sort(key=lambda item: item["value"], reverse=True)
 
     for item in opportunities:
-        own_pos = cache["own_locs"][item["own_index"]]
-        own_radius = float(cache["own_rads"][item["own_index"]])
+        if cache["own_count"] >= P["MAX_BLOBS"]:
+            own_pos = cache["own_locs_all"][item["own_index"]]
+            own_radius = float(cache["own_rads_all"][item["own_index"]])
+        else:
+            own_pos = cache["own_locs"][item["own_index"]]
+            own_radius = float(cache["own_rads"][item["own_index"]])
         direction = unit(item["position"] - own_pos)
         if direction is None:
             continue
@@ -1531,7 +1653,7 @@ def override_virus(cache):
         )
         if (
             can_split
-            and split_radius > item["radius"] * P["VIRUS_EAT_RATIO"]
+            and can_pop_virus(split_radius, item["radius"])
             and item["distance"] <= split_reach
             and manual_utility > 0.0
         ):
@@ -1696,7 +1818,6 @@ def choose_direction(game):
 
 
 def main():
-    #load_tuning_config()
     game = Game()
     while True:
         query = game.get_next_query()
