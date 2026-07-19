@@ -6,6 +6,12 @@ from lib.models.penguin_model import DirectionModel
 import numpy as np
 
 
+# Baseline-preserving rank-aware last-stand candidate (submission #123).
+# Identical to the successful #114 policy before round 900, apart from bounded
+# chase evaluation and correctness fixes. Late leaders remain exactly on the
+# baseline policy; only late trailers gain additional mass-positive options.
+
+
 # =============================================================================
 # Tuning surface
 # =============================================================================
@@ -23,6 +29,21 @@ PARAMS = {
     "MAX_FOOD": 40,
     "MAX_VIRUSES": 14,
     "SAFETY_OWN_PIECES": 2,
+    "RANK_PRESSURE_START_ROUND": 900,
+    "RANK_PRESSURE_MIN_RANK": 7,
+    "RANK_DESPERATE_START_ROUND": 1200,
+    "RANK_DESPERATE_MIN_RANK": 6,
+    "RANK_LAST_STAND_START_ROUND": 1250,
+    "RANK_LAST_STAND_MIN_RANK": 7,
+    "RANK_PRESSURE_MIN_UTILITY_MULT": 0.80,
+    "RANK_DESPERATE_MIN_UTILITY_MULT": 0.55,
+    "RANK_LAST_STAND_MIN_UTILITY": 0.0,
+    "RANK_TARGET_MASS_BONUS": 0.50,
+    "RANK_CHASE_RANGE_BONUS": 0.12,
+    "RANK_CHASE_COST_DISCOUNT": 0.10,
+    "RANK_DEPTH_COST_DISCOUNT": 0.10,
+    "RANK_FRAGMENT_COST_DISCOUNT": 0.12,
+    "RANK_EXTERNAL_RISK_DISCOUNT": 0.16,
     "STEP_RADIUS_MULT": 1.2709918139713585,
     "MOVE_LOOKAHEAD_TICKS": 3.0,
     "EAT_MASS_RATIO": 1.20,
@@ -77,10 +98,7 @@ PARAMS = {
     "SPLIT_MAX_LAUNCHERS": 2,
     # Sum of simulated split depths per decision. A depth-3 rollout costs three
     # units, keeping exact stabilisation comfortably below the turn timeout.
-    # One depth-4 rollout, two depth-2 rollouts, or four immediate captures.
-    # Analytical ranking chooses the candidate first; evaluating several deep
-    # alternatives in one server turn was the remaining cumulative-time tail.
-    "SPLIT_ROLLOUT_STEP_BUDGET": 4,
+    "SPLIT_ROLLOUT_STEP_BUDGET": 16,
     "SPLIT_CAPTURE_WEIGHT": 4.799170739486253,
     "SPLIT_TARGET_WEIGHT": 3.0,
     "SPLIT_DEPTH_COST": 4.382917879561087,
@@ -105,6 +123,7 @@ PARAMS = {
     "CHASE_VELOCITY_NEW_WEIGHT": 0.27979115446569386,
     "CHASE_PIECE_MATCH_DISTANCE": 4.0,
     "CHASE_PIECE_MEMORY_TICKS": 3,
+    "CHASE_MAX_PAIR_EVALUATIONS": 32,
     "BASE_PLAYER_SPEED": 1.1,
     "PLAYER_SPEED_RADIUS_FACTOR": 0.08,
     "MIN_PLAYER_SPEED": 0.25,
@@ -176,6 +195,7 @@ ENEMY_TRACKS = {}
 ENEMY_PIECE_TRACKS = {}
 NEXT_ENEMY_PIECE_TRACK_ID = 1
 FRAME_TICK = 0
+LAST_ENGINE_ROUND = None
 
 CHASE_TARGET_TRACK_ID = None
 CHASE_TICKS = 0
@@ -577,16 +597,6 @@ def update_enemy_piece_tracks(enemy_locs, enemy_rads, enemy_pids):
     return track_ids, velocities
 
 
-def ensure_enemy_piece_tracks(cache):
-    """Materialise piece velocities only for split/chase logic that uses them."""
-    if cache.get("enemy_velocities") is None:
-        track_ids, velocities = update_enemy_piece_tracks(
-            cache["enemy_locs"], cache["enemy_rads"], cache["enemy_pids"]
-        )
-        cache["enemy_track_ids"] = track_ids
-        cache["enemy_velocities"] = velocities
-
-
 def update_virus_memory(virus_locs, virus_rads):
     global VIRUS_MEMORY, VIRUS_CHAIN_SIGNATURE, VIRUS_CHAIN_VALUES
     for pos, radius in zip(virus_locs, virus_rads):
@@ -657,10 +667,72 @@ def update_own_eject_estimates(blob_ids, cooldowns):
     return np.array([updated[int(blob_id)] for blob_id in blob_ids], dtype=float)
 
 
+def reset_transient_state_after_round_gap():
+    """Clear observations made stale by the engine's 30-round death gap."""
+    global LAST_DIRECTION, LAST_SPLIT_REQUESTED, LAST_POSITION, STUCK_COUNT
+    global OWN_EJECT_ESTIMATES, ENEMY_TRACKS, ENEMY_PIECE_TRACKS
+    global NEXT_ENEMY_PIECE_TRACK_ID, CHASE_TARGET_TRACK_ID, CHASE_TICKS
+    global SPLIT_PLAN_PID, SPLIT_PLAN_POSITION, SPLIT_PLAN_STEPS, SPLIT_PLAN_WAIT
+    global VIRUS_MEMORY, VIRUS_TARGET_KEY, VIRUS_CHAIN_SIGNATURE
+    global VIRUS_CHAIN_VALUES, FOOD_TARGET, FOOD_TARGET_TICKS
+    global ROAM_DIRECTION, ROAM_TICKS
+
+    LAST_DIRECTION = np.array([1.0, 0.0], dtype=float)
+    LAST_SPLIT_REQUESTED = False
+    LAST_POSITION = None
+    STUCK_COUNT = 0
+    OWN_EJECT_ESTIMATES = {}
+    ENEMY_TRACKS = {}
+    ENEMY_PIECE_TRACKS = {}
+    NEXT_ENEMY_PIECE_TRACK_ID = 1
+    CHASE_TARGET_TRACK_ID = None
+    CHASE_TICKS = 0
+    SPLIT_PLAN_PID = None
+    SPLIT_PLAN_POSITION = None
+    SPLIT_PLAN_STEPS = 0
+    SPLIT_PLAN_WAIT = 0
+    VIRUS_MEMORY = {}
+    VIRUS_TARGET_KEY = None
+    VIRUS_CHAIN_SIGNATURE = None
+    VIRUS_CHAIN_VALUES = {}
+    FOOD_TARGET = None
+    FOOD_TARGET_TICKS = 0
+    ROAM_DIRECTION = None
+    ROAM_TICKS = 0
+
+
 def build_cache(game):
-    global FRAME_TICK
+    global FRAME_TICK, LAST_ENGINE_ROUND
+    engine_round = int(game.state.round)
+    if (
+        LAST_ENGINE_ROUND is not None
+        and engine_round > LAST_ENGINE_ROUND + 1
+    ):
+        reset_transient_state_after_round_gap()
+    LAST_ENGINE_ROUND = engine_round
     FRAME_TICK += 1
     me = game.state.me
+    rankings = [int(player_id) for player_id in game.state.rankings]
+    rank_by_pid = {
+        player_id: index + 1 for index, player_id in enumerate(rankings)
+    }
+    live_rank = rank_by_pid.get(int(me.player_id), len(rankings))
+    rank_mode = 0
+    if (
+        engine_round >= P["RANK_LAST_STAND_START_ROUND"]
+        and live_rank >= P["RANK_LAST_STAND_MIN_RANK"]
+    ):
+        rank_mode = 3
+    elif (
+        engine_round >= P["RANK_DESPERATE_START_ROUND"]
+        and live_rank >= P["RANK_DESPERATE_MIN_RANK"]
+    ):
+        rank_mode = 2
+    elif (
+        engine_round >= P["RANK_PRESSURE_START_ROUND"]
+        and live_rank >= P["RANK_PRESSURE_MIN_RANK"]
+    ):
+        rank_mode = 1
     origin = np.array([me.x, me.y], dtype=float)
 
     own = list(me.blobs.values())
@@ -746,6 +818,10 @@ def build_cache(game):
     own_locs = own_locs_all[keep]
     own_rads = own_rads_all[keep]
     own_eject = own_eject_all[keep]
+
+    enemy_track_ids, enemy_velocities = update_enemy_piece_tracks(
+        enemy_locs, enemy_rads, enemy_pids
+    )
 
     # Players that just left vision remain escape/split-risk threats, but are
     # deliberately not inserted into visible targets for chase or capture.
@@ -857,6 +933,10 @@ def build_cache(game):
     ) / max(total_mass, 1e-9)
 
     return {
+        "round": engine_round,
+        "live_rank": live_rank,
+        "rank_by_pid": rank_by_pid,
+        "rank_mode": rank_mode,
         "player_id": int(me.player_id),
         "position": position,
         "radius": float(np.sqrt(total_mass)),
@@ -874,10 +954,8 @@ def build_cache(game):
         "enemy_rads": enemy_rads,
         "enemy_pids": enemy_pids,
         "enemy_cooldowns": enemy_cooldowns,
-        # Piece identities and velocities are comparatively expensive to
-        # match. Split/chase materialise them only when their policy is reached.
-        "enemy_track_ids": None,
-        "enemy_velocities": None,
+        "enemy_track_ids": enemy_track_ids,
+        "enemy_velocities": enemy_velocities,
         "memory_threats": memory_threats,
         "summaries": summaries,
         "food_objects": foods,
@@ -1068,27 +1146,7 @@ def enemy_threat_sources(cache):
     # Add one direct-only virtual blob for a compact owner. Setting count to
     # MAX_BLOBS prevents the model from imagining an immediate merge *and*
     # another multi-split, which would be needlessly timid.
-    for pid, summary in cache["summaries"].items():
-        # Before constructing cooldown/compactness profiles, reject owners
-        # whose complete merged mass cannot eat a protected piece or whose
-        # entire visible pack is beyond any near-term direct-merge envelope.
-        merged_radius = float(np.sqrt(summary["mass"]))
-        if not np.any(
-            summary["mass"]
-            >= cache["own_rads"] ** 2 * P["EAT_MASS_RATIO"]
-        ):
-            continue
-        centroid_gaps = np.sqrt(np.sum(
-            (cache["own_locs"] - summary["centroid"]) ** 2,
-            axis=1,
-        )) - float(summary["cover_radius"])
-        merged_reach = (
-            merged_radius
-            + movement_speed(merged_radius) * P["ESCAPE_DIRECT_RANGE_MULT"]
-            + float(np.max(cache["own_rads"])) * P["ESCAPE_HARD_MARGIN"]
-        )
-        if float(np.min(centroid_gaps)) > merged_reach:
-            continue
+    for pid in cache["summaries"]:
         profile = owner_merge_profile(cache, pid)
         if profile is None:
             continue
@@ -1830,8 +1888,12 @@ def rollout_split(cache, direction, depth):
 
         # Engine decays mass, then attracts all sibling pieces by 0.08 toward
         # their mass centroid before resolving viruses and player eating.
-        masses = np.maximum(
-            masses * (1.0 - P["MASS_DECAY_RATE"]), 0.9 ** 2
+        minimum_mass = 0.9 ** 2
+        decayed = masses * (1.0 - P["MASS_DECAY_RATE"])
+        masses = np.where(
+            masses > minimum_mass,
+            np.maximum(decayed, minimum_mass),
+            masses,
         )
         positions, masses, blob_ids, eject, cooldowns = stabilise_projected_owner(
             positions, masses, blob_ids, eject, cooldowns
@@ -1882,10 +1944,17 @@ def rollout_split(cache, direction, depth):
             for enemy_index in target_order:
                 if captured[enemy_index]:
                     continue
-                enemy_mass = float(
+                initial_enemy_mass = float(
                     cache["enemy_rads"][enemy_index] ** 2
-                    * (1.0 - P["MASS_DECAY_RATE"]) ** (step + 1)
                 )
+                if initial_enemy_mass > minimum_mass:
+                    enemy_mass = max(
+                        minimum_mass,
+                        initial_enemy_mass
+                        * (1.0 - P["MASS_DECAY_RATE"]) ** (step + 1),
+                    )
+                else:
+                    enemy_mass = initial_enemy_mass
                 possible = (
                     (distance_sq[:, enemy_index] <= masses)
                     & can_eat_mass(
@@ -2009,10 +2078,11 @@ def split_target_priority(cache, target_index, maximum_depth):
         radius_profiles = profile_cache.get(radius_key)
         if radius_profiles is None:
             radius_profiles = []
-            for depth in range(1, maximum_depth + 1):
+            profile_cache[radius_key] = radius_profiles
+        if len(radius_profiles) < maximum_depth:
+            for depth in range(len(radius_profiles) + 1, maximum_depth + 1):
                 before, after, travels = split_profile(radius_key, depth)
                 radius_profiles.append((before, after, travels))
-            profile_cache[radius_key] = radius_profiles
         for depth in range(1, maximum_depth + 1):
             before, after, travels = radius_profiles[depth - 1]
             if np.any(before < P["SPLIT_MIN_RADIUS"]):
@@ -2053,7 +2123,6 @@ def split_opportunities(
         maximum_depth = min(maximum_depth, int(max_depth_override))
     if maximum_depth <= 0:
         return []
-    ensure_enemy_piece_tracks(cache)
 
     target_indices = np.arange(len(cache["enemy_locs"]), dtype=int)
     if required_pid is not None:
@@ -2129,7 +2198,9 @@ def split_opportunities(
                 # When attacking upward, the complete rollout must eat enough
                 # that the fed leading piece survives the owner's remainder.
                 if (
-                    owner_mass > cache["mass"] * P["SPLIT_LARGER_OWNER_RATIO"]
+                    cache["rank_mode"] < 3
+                    and owner_mass
+                    > cache["mass"] * P["SPLIT_LARGER_OWNER_RATIO"]
                     and can_eat_mass(
                         owner_remaining,
                         rollout["mass"],
@@ -2143,16 +2214,48 @@ def split_opportunities(
                     P["MAX_BLOBS"], cache["own_count"] * (2 ** depth)
                 )
                 fragmentation = max(0, projected_count - cache["own_count"])
+                risk_level = max(0, cache["rank_mode"])
+                if risk_level >= 3:
+                    depth_cost = 0.0
+                    fragment_cost = 0.0
+                    external_risk_weight = 0.0
+                else:
+                    depth_cost = P["SPLIT_DEPTH_COST"] * max(
+                        0.5,
+                        1.0 - P["RANK_DEPTH_COST_DISCOUNT"] * risk_level,
+                    )
+                    fragment_cost = P["SPLIT_FRAGMENT_COST"] * max(
+                        0.45,
+                        1.0 - P["RANK_FRAGMENT_COST_DISCOUNT"] * risk_level,
+                    )
+                    external_risk_weight = (
+                        P["SPLIT_EXTERNAL_RISK_WEIGHT"] * max(
+                            0.4,
+                            1.0 - (
+                                P["RANK_EXTERNAL_RISK_DISCOUNT"] * risk_level
+                            ),
+                        )
+                    )
                 utility = P["SPLIT_CAPTURE_WEIGHT"] * rollout["captured_mass"]
                 utility += P["SPLIT_TARGET_WEIGHT"] * target_mass
-                utility -= P["SPLIT_DEPTH_COST"] * depth
+                target_rank = cache["rank_by_pid"].get(
+                    target_pid, cache["live_rank"]
+                )
+                ranks_above = max(0, cache["live_rank"] - target_rank)
+                utility += (
+                    P["RANK_TARGET_MASS_BONUS"]
+                    * risk_level
+                    * min(ranks_above, 3)
+                    * target_mass
+                )
+                utility -= depth_cost * depth
                 utility -= (
-                    P["SPLIT_FRAGMENT_COST"]
+                    fragment_cost
                     * fragmentation
                     * cache["mass"]
                     / max(P["MAX_BLOBS"], 1)
                 )
-                utility -= P["SPLIT_EXTERNAL_RISK_WEIGHT"] * external_risk
+                utility -= external_risk_weight * external_risk
 
                 opportunities.append({
                     "utility": float(utility),
@@ -2214,6 +2317,18 @@ def counter_split_survives(cache, opportunity):
     return True
 
 
+def split_min_utility(cache):
+    if cache["rank_mode"] >= 3:
+        return P["RANK_LAST_STAND_MIN_UTILITY"]
+    if cache["rank_mode"] >= 2:
+        multiplier = P["RANK_DESPERATE_MIN_UTILITY_MULT"]
+    elif cache["rank_mode"] == 1:
+        multiplier = P["RANK_PRESSURE_MIN_UTILITY_MULT"]
+    else:
+        multiplier = 1.0
+    return P["SPLIT_MIN_UTILITY"] * multiplier
+
+
 def best_escape_counter_split(cache):
     """Return the best one-tick counter-capture, never a speculative combo."""
     for option in split_opportunities(
@@ -2222,7 +2337,7 @@ def best_escape_counter_split(cache):
         target_limit=P["ESCAPE_COUNTER_MAX_TARGETS"],
         rollout_step_budget=P["ESCAPE_COUNTER_STEP_BUDGET"],
     ):
-        if option["utility"] < P["SPLIT_MIN_UTILITY"]:
+        if option["utility"] < split_min_utility(cache):
             break
         if counter_split_survives(cache, option):
             return option
@@ -2249,7 +2364,7 @@ def override_split(cache):
             required_pid=SPLIT_PLAN_PID,
             max_depth_override=SPLIT_PLAN_STEPS,
         )
-        if options and options[0]["utility"] >= P["SPLIT_MIN_UTILITY"]:
+        if options and options[0]["utility"] >= split_min_utility(cache):
             best = options[0]
             SPLIT_PLAN_STEPS = max(0, best["depth"] - 1)
             SPLIT_PLAN_POSITION = best["target_position"].copy()
@@ -2272,7 +2387,7 @@ def override_split(cache):
         clear_split_plan()
 
     options = split_opportunities(cache)
-    if not options or options[0]["utility"] < P["SPLIT_MIN_UTILITY"]:
+    if not options or options[0]["utility"] < split_min_utility(cache):
         return None
 
     best = options[0]
@@ -2362,6 +2477,20 @@ def ray_wall_distance(position, direction):
 def chase_direction_safe(cache, desired):
     if desired is not None and movement_safe(cache, desired):
         return desired
+
+    # When a virus blocks the direct chase line, keep taking the same safe side
+    # around it. Re-selecting from symmetric headings every tick caused the
+    # observed left-right oscillation. This fast path also avoids the 12-way
+    # safety scan while the existing detour remains useful.
+    held = unit(LAST_DIRECTION)
+    if (
+        desired is not None
+        and held is not None
+        and float(np.dot(held, desired)) >= 0.50
+        and movement_safe(cache, held)
+    ):
+        return held
+
     best = None
     best_dot = -float("inf")
     for direction in DIRECTIONS:
@@ -2424,7 +2553,68 @@ def override_chase(cache):
         CHASE_TARGET_TRACK_ID = None
         CHASE_TICKS = 0
         return None
-    ensure_enemy_piece_tracks(cache)
+
+    risk_level = max(0, cache["rank_mode"])
+    chase_range_scale = 1.0 + P["RANK_CHASE_RANGE_BONUS"] * risk_level
+    chase_cost_scale = max(
+        0.55, 1.0 - P["RANK_CHASE_COST_DISCOUNT"] * risk_level
+    )
+    acquire_range = P["CHASE_ACQUIRE_RANGE_MULT"] * chase_range_scale
+    direct_range = P["CHASE_DIRECT_RANGE_MULT"] * chase_range_scale
+    wall_horizon = min(
+        P["ARENA_SIZE"], P["CHASE_WALL_HORIZON"] * chase_range_scale
+    )
+
+    own_locs = cache["own_locs_all"]
+    own_rads = cache["own_rads_all"]
+    enemy_locs = cache["enemy_locs"]
+    enemy_rads = cache["enemy_rads"]
+    pair_deltas = enemy_locs[None, :, :] - own_locs[:, None, :]
+    pair_distances = np.sqrt(np.sum(pair_deltas * pair_deltas, axis=2))
+    pair_gaps = pair_distances - own_rads[:, None]
+    edible = (
+        own_rads[:, None] ** 2
+        >= enemy_rads[None, :] ** 2 * P["EAT_MASS_RATIO"]
+    )
+    locked_enemies = cache["enemy_track_ids"] == CHASE_TARGET_TRACK_ID
+    valid = edible & (
+        (pair_gaps <= own_rads[:, None] * acquire_range)
+        | locked_enemies[None, :]
+    )
+    if not np.any(valid):
+        CHASE_TARGET_TRACK_ID = None
+        CHASE_TICKS = 0
+        return None
+    cheap_scores = (
+        P["CHASE_TARGET_MASS_WEIGHT"] * enemy_rads[None, :] ** 2
+        - P["CHASE_DISTANCE_WEIGHT"] * chase_cost_scale
+        * np.maximum(pair_gaps, 0.0)
+        + P["CHASE_LOCK_BONUS"] * locked_enemies[None, :]
+    )
+    cheap_scores[~valid] = -float("inf")
+    selected_pairs = set()
+    for enemy_index in range(len(enemy_locs)):
+        if np.any(valid[:, enemy_index]):
+            selected_pairs.add((
+                int(np.argmax(cheap_scores[:, enemy_index])), enemy_index
+            ))
+    remaining = max(
+        0, P["CHASE_MAX_PAIR_EVALUATIONS"] - len(selected_pairs)
+    )
+    if remaining > 0:
+        valid_flat = np.flatnonzero(valid)
+        if len(valid_flat) > remaining:
+            flat_scores = cheap_scores.ravel()[valid_flat]
+            top = np.argpartition(
+                flat_scores, len(flat_scores) - remaining
+            )[-remaining:]
+            valid_flat = valid_flat[top]
+        for flat_index in valid_flat:
+            selected_pairs.add(tuple(int(value) for value in np.unravel_index(
+                int(flat_index), valid.shape
+            )))
+            if len(selected_pairs) >= P["CHASE_MAX_PAIR_EVALUATIONS"]:
+                break
 
     candidates = []
     # Every fragment is a potential hunter.  Restricting this to the two
@@ -2439,6 +2629,8 @@ def override_chase(cache):
             cache["enemy_locs"], cache["enemy_rads"], cache["enemy_pids"],
             cache["enemy_track_ids"],
         )):
+            if (own_index, enemy_index) not in selected_pairs:
+                continue
             prey_mass = float(prey_radius ** 2)
             if not can_eat_mass(hunter_mass, prey_mass):
                 continue
@@ -2449,7 +2641,7 @@ def override_chase(cache):
             # the hunter radius. This is the true remaining capture gap.
             edge_distance = centre_distance - hunter_radius
             locked = int(track_id) == CHASE_TARGET_TRACK_ID
-            close = edge_distance <= hunter_radius * P["CHASE_ACQUIRE_RANGE_MULT"]
+            close = edge_distance <= hunter_radius * acquire_range
             if not close and not locked:
                 continue
 
@@ -2494,11 +2686,11 @@ def override_chase(cache):
 
             # If constant-velocity interception is impossible, only a nearby
             # wall can eventually change the geometry in our favour.
-            if not has_intercept and wall_distance > P["CHASE_WALL_HORIZON"]:
+            if not has_intercept and wall_distance > wall_horizon:
                 continue
             direct = (
-                edge_distance <= hunter_radius * P["CHASE_DIRECT_RANGE_MULT"]
-                or wall_distance <= P["CHASE_WALL_HORIZON"] * 0.35
+                edge_distance <= hunter_radius * direct_range
+                or wall_distance <= wall_horizon * 0.35
             )
             if direct:
                 aim = predicted
@@ -2516,13 +2708,27 @@ def override_chase(cache):
                 aim = predicted + center_side * offset
 
             score = P["CHASE_TARGET_MASS_WEIGHT"] * prey_mass
-            score -= P["CHASE_DISTANCE_WEIGHT"] * max(edge_distance, 0.0)
-            score -= P["CHASE_ETA_WEIGHT"] * eta
+            target_rank = cache["rank_by_pid"].get(
+                int(pid), cache["live_rank"]
+            )
+            ranks_above = max(0, cache["live_rank"] - target_rank)
+            score += (
+                P["RANK_TARGET_MASS_BONUS"]
+                * risk_level
+                * min(ranks_above, 3)
+                * prey_mass
+            )
+            score -= (
+                P["CHASE_DISTANCE_WEIGHT"]
+                * chase_cost_scale
+                * max(edge_distance, 0.0)
+            )
+            score -= P["CHASE_ETA_WEIGHT"] * chase_cost_scale * eta
             if locked:
                 score += P["CHASE_LOCK_BONUS"]
-            if wall_distance <= P["CHASE_WALL_HORIZON"]:
+            if wall_distance <= wall_horizon:
                 score += P["CHASE_LOCK_BONUS"] * (
-                    1.0 - wall_distance / max(P["CHASE_WALL_HORIZON"], 1e-6)
+                    1.0 - wall_distance / max(wall_horizon, 1e-6)
                 )
 
             candidates.append({
@@ -2620,6 +2826,8 @@ def movement_safe_to_virus(cache, direction, target_pos, expected_piece_radius):
 def virus_farming_allowed(cache):
     """Farm while small, capped at 16, or safely dominant over all known owners."""
     if cache["own_count"] >= P["MAX_BLOBS"]:
+        return True
+    if cache["rank_mode"] > 0:
         return True
     if cache["mass"] < P["VIRUS_MAX_FARM_MASS"]:
         return True
