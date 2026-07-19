@@ -98,7 +98,7 @@ PARAMS = {
     "SPLIT_MAX_LAUNCHERS": 2,
     # Sum of simulated split depths per decision. A depth-3 rollout costs three
     # units, keeping exact stabilisation comfortably below the turn timeout.
-    "SPLIT_ROLLOUT_STEP_BUDGET": 16,
+    "SPLIT_ROLLOUT_STEP_BUDGET": 10,
     "SPLIT_CAPTURE_WEIGHT": 4.799170739486253,
     "SPLIT_TARGET_WEIGHT": 3.0,
     "SPLIT_DEPTH_COST": 4.382917879561087,
