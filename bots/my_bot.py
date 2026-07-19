@@ -98,7 +98,7 @@ PARAMS = {
     "SPLIT_MAX_LAUNCHERS": 2,
     # Sum of simulated split depths per decision. A depth-3 rollout costs three
     # units, keeping exact stabilisation comfortably below the turn timeout.
-    "SPLIT_ROLLOUT_STEP_BUDGET": 10,
+    "SPLIT_ROLLOUT_STEP_BUDGET": 16,
     "SPLIT_CAPTURE_WEIGHT": 4.799170739486253,
     "SPLIT_TARGET_WEIGHT": 3.0,
     "SPLIT_DEPTH_COST": 4.382917879561087,
@@ -2617,128 +2617,127 @@ def override_chase(cache):
                 break
 
     candidates = []
-    # Every fragment is a potential hunter.  Restricting this to the two
-    # largest blobs wastes most of a 16-piece swarm even when a local fragment
-    # can finish prey immediately.
-    for own_index, (hunter_pos, hunter_radius) in enumerate(zip(
-        cache["own_locs_all"], cache["own_rads_all"]
-    )):
-        hunter_mass = float(hunter_radius ** 2)
+    # Evaluate only the already selected pairs.  The previous nested 16x24
+    # scan revisited every possible pair merely to discard all but at most 32.
+    # Sorting preserves the exact own-index/enemy-index order and therefore
+    # keeps score ties and behaviour identical while removing Python-loop work.
+    for own_index, enemy_index in sorted(selected_pairs):
+        hunter_pos = cache["own_locs_all"][own_index]
+        hunter_radius = float(cache["own_rads_all"][own_index])
+        hunter_mass = hunter_radius ** 2
         hunter_step = movement_speed(hunter_radius)
-        for enemy_index, (prey_pos, prey_radius, pid, track_id) in enumerate(zip(
-            cache["enemy_locs"], cache["enemy_rads"], cache["enemy_pids"],
-            cache["enemy_track_ids"],
-        )):
-            if (own_index, enemy_index) not in selected_pairs:
-                continue
-            prey_mass = float(prey_radius ** 2)
-            if not can_eat_mass(hunter_mass, prey_mass):
-                continue
+        prey_pos = cache["enemy_locs"][enemy_index]
+        prey_radius = float(cache["enemy_rads"][enemy_index])
+        pid = int(cache["enemy_pids"][enemy_index])
+        track_id = int(cache["enemy_track_ids"][enemy_index])
+        prey_mass = float(prey_radius ** 2)
+        if not can_eat_mass(hunter_mass, prey_mass):
+            continue
 
-            vector = prey_pos - hunter_pos
-            centre_distance = distance_2d(prey_pos, hunter_pos)
-            # Engine capture ignores target radius: target centre must enter
-            # the hunter radius. This is the true remaining capture gap.
-            edge_distance = centre_distance - hunter_radius
-            locked = int(track_id) == CHASE_TARGET_TRACK_ID
-            close = edge_distance <= hunter_radius * acquire_range
-            if not close and not locked:
-                continue
+        vector = prey_pos - hunter_pos
+        centre_distance = distance_2d(prey_pos, hunter_pos)
+        # Engine capture ignores target radius: target centre must enter
+        # the hunter radius. This is the true remaining capture gap.
+        edge_distance = centre_distance - hunter_radius
+        locked = int(track_id) == CHASE_TARGET_TRACK_ID
+        close = edge_distance <= hunter_radius * acquire_range
+        if not close and not locked:
+            continue
 
-            velocity = cache["enemy_velocities"][enemy_index]
-            escape_direction = unit(velocity)
-            if escape_direction is None:
-                escape_direction = unit(vector)
-            wall_distance = ray_wall_distance(prey_pos, escape_direction)
+        velocity = cache["enemy_velocities"][enemy_index]
+        escape_direction = unit(velocity)
+        if escape_direction is None:
+            escape_direction = unit(vector)
+        wall_distance = ray_wall_distance(prey_pos, escape_direction)
 
-            predicted, eta, has_intercept = intercept_point(
-                hunter_pos,
-                float(hunter_radius),
-                hunter_step,
-                prey_pos,
-                velocity,
+        predicted, eta, has_intercept = intercept_point(
+            hunter_pos,
+            float(hunter_radius),
+            hunter_step,
+            prey_pos,
+            velocity,
+        )
+        predicted = np.clip(
+            predicted,
+            float(prey_radius),
+            P["ARENA_SIZE"] - float(prey_radius),
+        )
+
+        # A target in a corner may be geometrically impossible to overlap
+        # because our centre is radius-constrained away from both walls.
+        # This is target-specific and clears immediately if that piece
+        # moves back into a capturable position.
+        if not capture_position_feasible(hunter_radius, predicted):
+            continue
+
+        # Piece-level edibility is insufficient when that piece belongs to
+        # a much larger compact owner. Do not walk a small hunter into its
+        # siblings unless eating the target makes the hunter unpunishable.
+        if chase_enters_merge_trap(
+            cache,
+            hunter_pos,
+            float(hunter_radius),
+            enemy_index,
+            predicted,
+            eta,
+        ):
+            continue
+
+        # If constant-velocity interception is impossible, only a nearby
+        # wall can eventually change the geometry in our favour.
+        if not has_intercept and wall_distance > wall_horizon:
+            continue
+        direct = (
+            edge_distance <= hunter_radius * direct_range
+            or wall_distance <= wall_horizon * 0.35
+        )
+        if direct:
+            aim = predicted
+        else:
+            center = np.array([P["ARENA_SIZE"] / 2.0] * 2, dtype=float)
+            center_side = unit(center - predicted)
+            if center_side is None:
+                center_side = unit(predicted - hunter_pos)
+            if center_side is None:
+                center_side = np.zeros(2, dtype=float)
+            offset = min(
+                hunter_radius * P["CHASE_BLOCK_OFFSET_MULT"],
+                prey_radius * 2.0,
             )
-            predicted = np.clip(
-                predicted,
-                float(prey_radius),
-                P["ARENA_SIZE"] - float(prey_radius),
+            aim = predicted + center_side * offset
+
+        score = P["CHASE_TARGET_MASS_WEIGHT"] * prey_mass
+        target_rank = cache["rank_by_pid"].get(
+            int(pid), cache["live_rank"]
+        )
+        ranks_above = max(0, cache["live_rank"] - target_rank)
+        score += (
+            P["RANK_TARGET_MASS_BONUS"]
+            * risk_level
+            * min(ranks_above, 3)
+            * prey_mass
+        )
+        score -= (
+            P["CHASE_DISTANCE_WEIGHT"]
+            * chase_cost_scale
+            * max(edge_distance, 0.0)
+        )
+        score -= P["CHASE_ETA_WEIGHT"] * chase_cost_scale * eta
+        if locked:
+            score += P["CHASE_LOCK_BONUS"]
+        if wall_distance <= wall_horizon:
+            score += P["CHASE_LOCK_BONUS"] * (
+                1.0 - wall_distance / max(wall_horizon, 1e-6)
             )
 
-            # A target in a corner may be geometrically impossible to overlap
-            # because our centre is radius-constrained away from both walls.
-            # This is target-specific and clears immediately if that piece
-            # moves back into a capturable position.
-            if not capture_position_feasible(hunter_radius, predicted):
-                continue
-
-            # Piece-level edibility is insufficient when that piece belongs to
-            # a much larger compact owner. Do not walk a small hunter into its
-            # siblings unless eating the target makes the hunter unpunishable.
-            if chase_enters_merge_trap(
-                cache,
-                hunter_pos,
-                float(hunter_radius),
-                enemy_index,
-                predicted,
-                eta,
-            ):
-                continue
-
-            # If constant-velocity interception is impossible, only a nearby
-            # wall can eventually change the geometry in our favour.
-            if not has_intercept and wall_distance > wall_horizon:
-                continue
-            direct = (
-                edge_distance <= hunter_radius * direct_range
-                or wall_distance <= wall_horizon * 0.35
-            )
-            if direct:
-                aim = predicted
-            else:
-                center = np.array([P["ARENA_SIZE"] / 2.0] * 2, dtype=float)
-                center_side = unit(center - predicted)
-                if center_side is None:
-                    center_side = unit(predicted - hunter_pos)
-                if center_side is None:
-                    center_side = np.zeros(2, dtype=float)
-                offset = min(
-                    hunter_radius * P["CHASE_BLOCK_OFFSET_MULT"],
-                    prey_radius * 2.0,
-                )
-                aim = predicted + center_side * offset
-
-            score = P["CHASE_TARGET_MASS_WEIGHT"] * prey_mass
-            target_rank = cache["rank_by_pid"].get(
-                int(pid), cache["live_rank"]
-            )
-            ranks_above = max(0, cache["live_rank"] - target_rank)
-            score += (
-                P["RANK_TARGET_MASS_BONUS"]
-                * risk_level
-                * min(ranks_above, 3)
-                * prey_mass
-            )
-            score -= (
-                P["CHASE_DISTANCE_WEIGHT"]
-                * chase_cost_scale
-                * max(edge_distance, 0.0)
-            )
-            score -= P["CHASE_ETA_WEIGHT"] * chase_cost_scale * eta
-            if locked:
-                score += P["CHASE_LOCK_BONUS"]
-            if wall_distance <= wall_horizon:
-                score += P["CHASE_LOCK_BONUS"] * (
-                    1.0 - wall_distance / max(wall_horizon, 1e-6)
-                )
-
-            candidates.append({
-                "score": float(score),
-                "pid": int(pid),
-                "track_id": int(track_id),
-                "aim": aim,
-                "hunter_pos": hunter_pos,
-                "wall_distance": wall_distance,
-            })
+        candidates.append({
+            "score": float(score),
+            "pid": int(pid),
+            "track_id": int(track_id),
+            "aim": aim,
+            "hunter_pos": hunter_pos,
+            "wall_distance": wall_distance,
+        })
 
     if not candidates:
         CHASE_TARGET_TRACK_ID = None
