@@ -1,6 +1,6 @@
 # PorkyPig
 
-On each move, the bot builds a cache of visible blobs, food and viruses, plus remembered enemy/virus state.
+On each move, the bot builds a cache of visible blobs, food, viruses, and previously remembered enemies/viruses.
 
 ```text
 for override in [Escape, Split, Virus, Chase, Unstuck, Food]:
@@ -8,21 +8,24 @@ for override in [Escape, Split, Virus, Chase, Unstuck, Food]:
         execute it
 ```
 
-## Overrides
+### Overrides
 
-### Escape
-Safety layer. It estimates whether visible or recently seen enemies can reach our pieces now or after splitting, then chooses space that survives.
+** Escape **
+Estimates whether visible or recently seen enemies can reach our pieces now or after splitting, then chooses space that survives.
 
-### Split
+** Split ** 
 The main snowball tool. It tests capture plans by rolling them forward and rejects attacks that miss, hit bad viruses, or feed another enemy.
 
-### Virus
+** Virus ** 
 Remembers virus coordinates after they leave view, so the bot can revisit farms and chain nearby viruses instead of reacting only to vision.
 
-### Chase
-Predicts fragment movement, uses walls to finish targets, and avoids merging opponents.
+** Chase ** 
+Predicts enemy blob movement by a few ticks and uses walls to corner targets.
 
-### Unstuck / Food
+** Unstuck / Food ** 
 Unstuck breaks stalls. Food collects dense clusters before smooth roaming.
 
-Late-game rank logic takes more risk when behind.
+** Other ** 
+Takes more risk when behind (7th/8th) on leader-board.
+ML (optimise.py) used for parameter tuning.
+
