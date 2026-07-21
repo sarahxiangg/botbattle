@@ -1,30 +1,24 @@
 # PorkyPig
 
-PorkyPig makes a bounded decision each tick: build a cache from visible objects and memory, then try each override in priority order.
+On each move, the bot builds a cache of visible blobs, food and viruses, plus remembered enemy/virus state, then runs this override order:
 
-```text
-cache = build_cache(game)
-for name in OVERRIDE_ORDER:
-    result = OVERRIDES[name](cache)
-    if result:
-        save direction and split flag
-        return result
-return previous direction
-```
+**Escape → Split → Virus → Chase → Unstuck → Food**
 
-## Escape
-Checks whether enemies can reach our blobs now or after splitting, including recent hidden enemies, then chooses the safest heading.
+## Overrides
 
-## Split
-Finds valuable captures, rolls the split forward, and rejects attacks likely to hit viruses, miss the target, or get punished by another enemy.
+### Escape
+Safety layer. It estimates whether visible or recently seen enemies can reach our pieces now or after splitting, then chooses space that survives.
 
-## Virus
-Remembers virus coordinates after they leave view, values nearby virus chains, and keeps farming the same safe target.
+### Split
+The main snowball tool. It tests capture plans by rolling them forward and rejects attacks that miss, hit bad viruses, or feed another enemy.
 
-## Chase
-Tracks enemy fragments, predicts prey movement, uses walls to trap them, avoids merging opponents, and holds one detour around blocking viruses.
+### Virus
+Remembers virus coordinates after they leave view, so the bot can revisit farms and chain nearby viruses instead of reacting only to vision.
 
-## Food / Unstuck
-Food collects clusters. Unstuck is a fallback.
+### Chase
+Predicts fragment movement, uses walls to finish targets, and avoids merging opponents.
 
-Late-game rank logic takes more risk when trailing.
+### Unstuck / Food
+Unstuck breaks stalls. Food collects dense clusters before smooth roaming.
+
+Late-game rank logic takes more risk when behind. Cached, bounded searches keep decisions within the time limit.
