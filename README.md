@@ -12,26 +12,36 @@ for override in [Escape, Split, Virus, Chase, Unstuck, Food]:
 
 **Escape**
 
-Estimates whether visible or recently seen enemies can reach our pieces immediately or after splitting, then chooses the space with the highest chance of survival.
+Estimates whether visible or recently seen enemies can reach our pieces now or after splitting, then chooses space that survives.
+
+<br>
 
 **Split**
 
-The main snowball tool. It tests capture plans by rolling them forward and rejects attacks that would miss, hit dangerous viruses, or feed another enemy.
+The main snowball tool. It tests capture plans by rolling them forward and rejects attacks that miss, hit bad viruses, or feed another enemy.
+
+<br>
 
 **Virus**
 
-Remembers virus coordinates after they leave view, allowing the bot to revisit farms and chain nearby viruses instead of reacting only to currently visible targets.
+Remembers virus coordinates after they leave view, so the bot can revisit farms and chain nearby viruses instead of reacting only to vision.
+
+<br>
 
 **Chase**
 
-Predicts enemy blob movement several ticks ahead and uses walls to corner targets.
+Predicts enemy blob movement by a few ticks and uses walls to corner targets.
+
+<br>
 
 **Unstuck / Food**
 
-Unstuck breaks stalls. Food targets dense clusters before transitioning to smooth roaming.
+Unstuck breaks stalls. Food collects dense clusters before smooth roaming.
+
+<br>
 
 **Other**
 
-Takes greater risks when ranked 7th or 8th on the leaderboard.
+Takes more risk when behind in 7th or 8th place on the leaderboard.
 
 Machine learning through `optimise.py` was used for parameter tuning.
