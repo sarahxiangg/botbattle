@@ -1,8 +1,12 @@
 # PorkyPig
 
-On each move, the bot builds a cache of visible blobs, food and viruses, plus remembered enemy/virus state, then runs this override order:
+On each move, the bot builds a cache of visible blobs, food and viruses, plus remembered enemy/virus state.
 
-**Escape → Split → Virus → Chase → Unstuck → Food**
+```text
+for override in [Escape, Split, Virus, Chase, Unstuck, Food]:
+    if override finds a safe action:
+        execute it
+```
 
 ## Overrides
 
@@ -21,4 +25,4 @@ Predicts fragment movement, uses walls to finish targets, and avoids merging opp
 ### Unstuck / Food
 Unstuck breaks stalls. Food collects dense clusters before smooth roaming.
 
-Late-game rank logic takes more risk when behind. Cached, bounded searches keep decisions within the time limit.
+Late-game rank logic takes more risk when behind.
