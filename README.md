@@ -1,47 +1,30 @@
 # PorkyPig (`bots/my_bot.py`)
 
-On each move, the bot builds a cache of visible blobs, food, viruses, and previously remembered enemies and viruses.
+On each move, the bot builds a cache of visible blobs, food, viruses, and previously seen enemies/viruses. Then executes main loop:
 
 ```text
 for override in [Escape, Split, Virus, Chase, Unstuck, Food]:
-    if override finds a safe action:
-        execute it
+    if override(cache) is safe:
+        execute and return
 ```
 
 ### Overrides
 
 **Escape**
-
-Estimates whether visible or recently seen enemies can reach our pieces now or after splitting, then chooses space that survives.
-
-<br>
+Estimates whether visible or recently seen enemies can reach our blob now or after splitting, then chooses safe direction.
 
 **Split**
-
-The main snowball tool. It tests capture plans by rolling them forward and rejects attacks that miss, hit bad viruses, or feed another enemy.
-
-<br>
+Tests capture plans by rolling them forward and rejects attacks that miss, hit bad viruses, or feed another enemy.
 
 **Virus**
-
-Remembers virus coordinates after they leave view, so the bot can revisit farms and chain nearby viruses instead of reacting only to vision.
-
-<br>
+Remembers virus coordinates after they leave view, so the bot can revisit nearby viruses instead of reacting only to vision.
 
 **Chase**
-
 Predicts enemy blob movement by a few ticks and uses walls to corner targets.
 
-<br>
-
 **Unstuck / Food**
-
-Unstuck breaks stalls. Food collects dense clusters before smooth roaming.
-
-<br>
+Unstuck stop glitching/stalling. Food favours dense clusters.
 
 **Other**
-
-Takes more risk when behind in 7th or 8th place on the leaderboard.
-
-Machine learning through `optimise.py` was used for parameter tuning.
+Bot takes more risk when behind (7th/8th) on leaderboard.
+ML (`optimise.py`) used for parameter tuning (genetic algorithm).
