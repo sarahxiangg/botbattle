@@ -1,26 +1,27 @@
 # PorkyPig
 
+PorkyPig is a priority-based agent: each tick it updates its world model, then runs policies until one returns a safe action.
+
 ```text
-observe visible state
-update enemy, fragment, and virus memory
-
-for policy in [escape, split, virus, chase, unstuck, food]:
-    action = policy()
-    if action is valid and safe:
-        execute action
-        stop
-
-continue previous safe direction
+update memory
+for policy in [Escape, Split, Virus, Chase, Unstuck, Food]:
+    if safe action exists: execute it
+continue previous heading
 ```
 
-**Escape** models direct and multi-split kill ranges, remembered threats, walls, and viruses that can shield us from pursuers.
+## Escape
+Builds direct and multi-split threat envelopes from visible and remembered enemies, walls, and virus shields, then selects the safest direction.
 
-**Split** first uses cheap geometric reach tests, then runs bounded engine-style simulations of movement, decay, merging, virus collisions, and captures.
+## Split
+Applies cheap geometric filters before bounded engine-style rollouts simulating movement, decay, merging, virus contact, captures, and post-split risk.
 
-**Virus** maintains a persistent coordinate map, allowing the bot to remember farming locations and estimate the value of nearby virus chains after they leave vision.
+## Virus
+Stores virus coordinates beyond visibility, values nearby virus chains, and follows safe farming routes while preserving target continuity.
 
-**Chase** tracks individual fragment velocity, predicts interception points, uses walls to trap prey, avoids opponents about to merge, and preserves one detour direction when a virus blocks the path.
+## Chase
+Tracks individual enemy fragments, estimates velocity, predicts interceptions, uses walls to trap prey, avoids merge traps, and prevents oscillation around viruses.
 
-**Unstuck** resolves genuine low-movement states, while **Food** targets dense clusters and otherwise roams smoothly.
+## Unstuck and Food
+Unstuck handles genuine low movement. Food targets dense clusters and otherwise roams smoothly.
 
-Late-game rank awareness increases aggression only when trailing. Expensive calculations are capped, cached, and limited to promising targets.
+Late-game rank awareness increases aggression only when trailing.
