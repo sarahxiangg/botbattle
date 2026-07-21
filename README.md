@@ -1,27 +1,30 @@
 # PorkyPig
 
-PorkyPig is a priority-based agent: each tick it updates its world model, then runs policies until one returns a safe action.
+PorkyPig makes a bounded decision each tick: build a cache from visible objects and memory, then try each override in priority order.
 
 ```text
-update memory
-for policy in [Escape, Split, Virus, Chase, Unstuck, Food]:
-    if safe action exists: execute it
-continue previous heading
+cache = build_cache(game)
+for name in OVERRIDE_ORDER:
+    result = OVERRIDES[name](cache)
+    if result:
+        save direction and split flag
+        return result
+return previous direction
 ```
 
 ## Escape
-Builds direct and multi-split threat envelopes from visible and remembered enemies, walls, and virus shields, then selects the safest direction.
+Checks whether enemies can reach our blobs now or after splitting, including recent hidden enemies, then chooses the safest heading.
 
 ## Split
-Applies cheap geometric filters before bounded engine-style rollouts simulating movement, decay, merging, virus contact, captures, and post-split risk.
+Finds valuable captures, rolls the split forward, and rejects attacks likely to hit viruses, miss the target, or get punished by another enemy.
 
 ## Virus
-Stores virus coordinates beyond visibility, values nearby virus chains, and follows safe farming routes while preserving target continuity.
+Remembers virus coordinates after they leave view, values nearby virus chains, and keeps farming the same safe target.
 
 ## Chase
-Tracks individual enemy fragments, estimates velocity, predicts interceptions, uses walls to trap prey, avoids merge traps, and prevents oscillation around viruses.
+Tracks enemy fragments, predicts prey movement, uses walls to trap them, avoids merging opponents, and holds one detour around blocking viruses.
 
-## Unstuck and Food
-Unstuck handles genuine low movement. Food targets dense clusters and otherwise roams smoothly.
+## Food / Unstuck
+Food collects clusters. Unstuck is a fallback.
 
-Late-game rank awareness increases aggression only when trailing.
+Late-game rank logic takes more risk when trailing.
