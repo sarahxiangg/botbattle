@@ -1,45 +1,26 @@
-# agario-competitor
+# PorkyPig
 
-Starter repo for a competition bot.
+```text
+observe visible state
+update enemy, fragment, and virus memory
 
-## First run
-1. [Install UV](https://docs.astral.sh/uv/getting-started/installation/)
+for policy in [escape, split, virus, chase, unstuck, food]:
+    action = policy()
+    if action is valid and safe:
+        execute action
+        stop
 
-2. Run these from this folder
-```bash
-uv sync --upgrade
-uv run interactive 7:bots/my_bot.py
+continue previous safe direction
 ```
 
-This template installs the published `agario-kit` package from PyPI. The local
-interactive launcher expects `count:path` specs whose counts sum to `n - 1`.
-For the current 8-player game, that means the counts must sum to `7`.
+**Escape** models direct and multi-split kill ranges, remembered threats, walls, and viruses that can shield us from pursuers.
 
-To play manually against example bots instead, run:
+**Split** first uses cheap geometric reach tests, then runs bounded engine-style simulations of movement, decay, merging, virus collisions, and captures.
 
-```bash
-uv run interactive 2:bots/my_bot.py 5:bots/other_bot.py
-```
+**Virus** maintains a persistent coordinate map, allowing the bot to remember farming locations and estimate the value of nearby virus chains after they leave vision.
 
-To watch a non-interactive simulation, run:
+**Chase** tracks individual fragment velocity, predicts interception points, uses walls to trap prey, avoids opponents about to merge, and preserves one detour direction when a virus blocks the path.
 
-```bash
-uv run simulation 8:bots/my_bot.py
-```
+**Unstuck** resolves genuine low-movement states, while **Food** targets dense clusters and otherwise roams smoothly.
 
-## Writing a bot
-
-- Put your bot logic in `bots/my_bot.py`.
-- Import `Game` from `helper.game`.
-- Read visible state from `game.state`.
-- Return moves using the `lib.interface.events.moves` models.
-
-## Updating during the competition
-
-We may make changes to the game engine during the event. When a new platform version is published, please run this command to bring your version of the game engine up to date:
-
-```bash
-uv sync --upgrade
-```
-
-We will send a message on [Discord](https://discord.gg/24We3YWM7e) if this happens.
+Late-game rank awareness increases aggression only when trailing. Expensive calculations are capped, cached, and limited to promising targets.
