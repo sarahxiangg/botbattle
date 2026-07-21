@@ -23,7 +23,7 @@ Remembers virus coordinates after they leave view, so the bot can revisit nearby
 Predicts enemy blob movement by a few ticks and uses walls to corner targets.
 
 **Unstuck / Food**<br>
-Unstuck stop glitching/stalling. Food favours dense clusters.
+Unstuck stops glitching/stalling. Food favours dense clusters.
 
 **Other**<br>
 Bot takes more risk when behind (7th/8th) on leaderboard.
