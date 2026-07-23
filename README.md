@@ -1,4 +1,4 @@
-# PorkyPig (`bots/my_bot.py`)🥈
+# PorkyPig (`bots/my_bot.py`)
 
 On each move, the bot builds a cache of visible blobs, food, viruses, and previously seen enemies/viruses. Then executes main loop:
 
